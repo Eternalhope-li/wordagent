@@ -1,10 +1,11 @@
-﻿"""WordAgent 桌面版（PC 端软件入口）— CustomTkinter 现代界面。
+"""WordAgent 桌面版 v1.8.0 — 聊天式 AI 文档助手（PC 端软件）。
 
-运行：python gui.py   （Windows 可直接双击「启动桌面版.bat」）
+交互方式：
+- 像聊天一样直接输入要求，AI 自动判断「生成新文档 / 按模板填写 / 编辑已有文档」。
+- 点「📎 附件」选择 .docx（要编辑的文档或模板）以及参考文件（图片 / PDF / 文本）。
+- 每次生成与修改的关键信息都会记入本地记忆，形成跨对话的长期上下文。
 
-两种模式：
-- 生成新文档：输入需求 -> 自动生成排版好的 docx
-- 编辑已有文档：选择 .docx -> 输入修改要求 -> 预览修改计划 -> 确认后落笔（自动备份）
+运行：python gui.py
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import customtkinter as ctk
@@ -23,9 +25,13 @@ from agent import (
 )
 
 APP_TITLE = f"WordAgent AI 文档助手 v{__version__}"
+VERSION_LABEL = f"v{__version__}"
 
-PLACEHOLDER_GEN = "请输入文档需求，例如：\n写一份《2026 年市场推广方案》，商务风格，包含市场分析、目标人群、渠道策略、预算与效果预估，约 6 个章节。"
-PLACEHOLDER_EDIT = "请输入修改要求，例如：\n把标题改成《2026 年度市场推广方案》\n把第二段改得更正式\n删除最后一段\n在“渠道策略”后新增一节：风险分析"
+PLACEHOLDER = (
+    "输入你的文档要求，例如：\n"
+    "· 写一份《数据库课程实验报告》，含实验目的、实验环境、实验步骤、结果与分析\n"
+    "· 或点「📎 附件」添加 .docx 后说：把标题改成《XXX》，第二节改得更正式"
+)
 
 STD_OPTIONS = [
     "auto（AI 自动识别）",
@@ -47,12 +53,24 @@ STYLE_OPTIONS = [
     "default（通用）",
 ]
 
-# 品牌配色（浅色主题下使用；深色主题组件自动适配）
+CHIP_PROMPTS = [
+    ("📊 实验报告", "写一份《科目：实验报告》，要求包含：实验目的、实验环境、实验原理、实验步骤、实验数据记录、结果分析与结论，数据需合理详实。"),
+    ("📝 会议纪要", "写一份会议纪要，包含：会议主题、时间地点、参会人员、会议内容、决议事项、后续行动项与责任人。"),
+    ("📦 需求文档", "写一份软件需求文档（PRD），包含：项目背景、目标用户、功能需求、非功能需求、交互流程、验收标准。"),
+    ("🗓 周报", "写一份本周工作周报，包含：本周完成事项、关键进展、遇到的问题与解决、下周工作计划。"),
+    ("📈 数据分析", "写一份数据分析报告，包含：数据来源、分析指标、趋势分析、异常说明、结论与建议。"),
+    ("✏️ 编辑/套模板", "（先点 📎 添加 .docx 再发送）把标题改成……，第二节改得更正式……"),
+]
+
+# ---- 主题配色（亮色, 深色） ----
 BRAND = "#2B6DE8"
-BRAND_DARK = "#1E3A8A"
 BRAND_HOVER = "#1E5BD6"
-# 亮/暗双色（(浅色, 深色)），组件随主题自动切换
-SIDEBAR = ("#EAF0FA", "#1B2432")
+USER_BUBBLE = ("#2B6DE8", "#2563EB")
+ASSIST_BUBBLE = ("#F1F5FB", "#253047")
+CHAT_BG = ("#F4F6FA", "#0F131B")
+APP_BG = ("#F4F6FA", "#0F131B")
+INPUT_BG = ("#FFFFFF", "#2B3A52")
+SIDEBAR = ("#FFFFFF", "#151B26")
 SIDEBAR_TEXT = ("#5B6B8C", "#93A6C4")
 SIDEBAR_BTN_TEXT = ("#2B3A55", "#DAE5F8")
 SIDEBAR_BTN_HOVER = ("#D5E1F5", "#32466B")
@@ -60,8 +78,17 @@ SIDEBAR_BTN_BORDER = ("#B8C7E4", "#46597E")
 BTN_SOLID = ("#5B6B8C", "#46536E")
 BTN_SOLID_HOVER = ("#46536E", "#38445A")
 MUTED_TEXT = ("#7A87A3", "#94A6C2")
-LOG_BG = ("#F7F9FD", "#1A2330")
-LOG_TEXT = ("#33415C", "#D9E4F8")
+ERROR_TEXT = ("#C0392B", "#FF8A80")
+GREEN = "#2E9E5B"
+GREEN_HOVER = "#238049"
+
+FILL_KEYWORDS = ("填写", "填充", "填一下", "模板", "模版", "套用", "照着", "补全", "填空")
+# 强编辑词：没有附文档时也能判断“想编辑”
+STRONG_EDIT = ("修改", "编辑", "删除", "删掉", "替换", "改成", "改为", "更正", "重写",
+               "改一下", "改一改", "加一节", "加一段", "润色", "删去", "调整内容")
+# 弱编辑词：只有附了 .docx 时才视为编辑意图，避免误伤生成类需求
+WEAK_EDIT = ("调整", "更新", "修正", "补充", "完善", "排版", "格式", "新增", "添加",
+             "去掉", "不要", "重排", "精修", "美化", "改")
 
 
 class WordAgentApp:
@@ -72,243 +99,734 @@ class WordAgentApp:
         self.events: queue.Queue = queue.Queue()
         self.busy = False
         self.last_output: Path | None = None
-        self.ref_files: list[str] = []
+        self.attachments: list[str] = []
 
-        # 恢复上次使用的主题（记忆里持久化）
+        # 聊天状态
+        self.chat_history: list[dict] = []
+        self._mid = 0
+        self._bubbles: dict[int, list] = {}
+        self._current_mid: int | None = None
+        self._plan_evt: threading.Event | None = None
+        self._plan_ok = False
+        self._edit_evt: threading.Event | None = None
+        self._edit_state: dict | None = None
+        self._edit_ok = False
+        self._started_at = 0.0
+
         saved_theme = self.memory.get_setting("theme", "")
         if saved_theme in ("light", "dark"):
-            ctk.set_appearance_mode("dark" if saved_theme == "dark" else "light")
+            ctk.set_appearance_mode(saved_theme)
         self._build_ui()
-        self._theme_initialized = False
-        self._apply_saved_theme()
-        self._log(f"欢迎使用 {APP_TITLE}")
+        self._apply_caret_color()
+        self._greet()
         if self.config.api_key:
-            self._log(f"✓ 已读取 API Key（模型：{self.config.model}）")
+            self._set_status(f"就绪 · 已配置 {self.config.model}")
         else:
-            self._log("⚠ 未检测到 API Key，请在左侧填写，或创建 .env 文件（参考 .env.example）")
+            self._set_status("就绪 · 请先在左侧填写 API Key")
         self.root.after(120, self._poll_events)
 
     # ================= UI 构建 =================
     def _build_ui(self) -> None:
         self.root.title(APP_TITLE)
-        self.root.geometry("1160x820")
-        self.root.minsize(980, 700)
+        self.root.geometry("1280x860")
+        self.root.minsize(1040, 720)
 
-        # ---------- 顶部品牌栏 ----------
-        header = ctk.CTkFrame(self.root, corner_radius=0, fg_color=BRAND_DARK, height=64)
+        # 顶部品牌栏
+        header = ctk.CTkFrame(self.root, corner_radius=0, fg_color=("#1B3F9E", "#0D1526"), height=48)
         header.pack(fill="x")
         header.pack_propagate(False)
+        ctk.CTkLabel(header, text="📄 WordAgent", font=ctk.CTkFont("Microsoft YaHei UI", 17, "bold"),
+                     text_color=("white", "#E2E8F0")).pack(side="left", padx=18)
+        ctk.CTkLabel(header, text="AI 文档生成 · 模板填写 · 智能编辑",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                     text_color=("#DCE6FF", "#8AA0C4")).pack(side="left", padx=(0, 6))
+        self.header_status = ctk.CTkLabel(header, text="就绪",
+                                          font=ctk.CTkFont("Microsoft YaHei UI", 12),
+                                          text_color=("#DCE6FF", "#93A6C4"))
+        self.header_status.pack(side="right", padx=18)
 
-        brand = ctk.CTkLabel(header, text="📄 WordAgent", font=ctk.CTkFont("Microsoft YaHei UI", 22, "bold"),
-                             text_color="#FFFFFF")
-        brand.pack(side="left", padx=(20, 8), pady=12)
-        ctk.CTkLabel(header, text="AI 文档生成与编辑助手", font=ctk.CTkFont("Microsoft YaHei UI", 12),
-                     text_color="#BFD0F0").pack(side="left", pady=12)
-        ctk.CTkLabel(header, text=f"v{__version__}", font=ctk.CTkFont("Consolas", 11),
-                     text_color="#93A8D0").pack(side="right", padx=(0, 14))
-        self.theme_menu = ctk.CTkOptionMenu(
-            header, values=["浅色", "深色"], width=88, corner_radius=14,
-            fg_color=BRAND, button_color=BRAND_HOVER, button_hover_color="#1748B8",
-            text_color="#FFFFFF", command=self._on_theme_change,
-        )
-        self.theme_menu.set("浅色")
-        self.theme_menu.pack(side="right", padx=(0, 16), pady=14)
-
-        body = ctk.CTkFrame(self.root, fg_color="transparent", corner_radius=0)
+        body = ctk.CTkFrame(self.root, fg_color="transparent")
         body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+        self._build_sidebar(body)
+        self._build_chat(body)
 
-        # ---------- 左侧边栏 ----------
-        self.sidebar = ctk.CTkFrame(body, width=216, corner_radius=0, fg_color=SIDEBAR)
-        self.sidebar.pack(side="left", fill="y", padx=0, pady=0)
-        self.sidebar.pack_propagate(False)
+    # ---------- 左侧边栏 ----------
+    def _build_sidebar(self, body) -> None:
+        side = ctk.CTkFrame(body, width=240, corner_radius=0, fg_color=SIDEBAR)
+        side.grid(row=0, column=0, sticky="nsw")
+        side.grid_propagate(False)
 
-        ctk.CTkLabel(self.sidebar, text="工作模式", font=ctk.CTkFont("Microsoft YaHei UI", 12, "bold"),
-                     text_color=SIDEBAR_TEXT).pack(anchor="w", padx=18, pady=(18, 8))
+        def section(title: str) -> None:
+            ctk.CTkLabel(side, text=title, anchor="w",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 11, "bold"),
+                         text_color=SIDEBAR_TEXT).pack(fill="x", padx=16, pady=(12, 4))
 
-        self.mode_var = "generate"
-        self.mode_gen_btn = self._mode_button("✨ 生成新文档", 0, self._switch_generate)
-        self.mode_edit_btn = self._mode_button("✏️ 编辑已有文档", 1, self._switch_edit)
-
-        ctk.CTkLabel(self.sidebar, text="模型配置", font=ctk.CTkFont("Microsoft YaHei UI", 12, "bold"),
-                     text_color=SIDEBAR_TEXT).pack(anchor="w", padx=18, pady=(20, 8))
-
+        # —— 模型配置 ——
+        section("🔑 模型配置")
         self.key_var = ctk.StringVar(value=self.config.api_key)
+        ctk.CTkEntry(side, textvariable=self.key_var, placeholder_text="DeepSeek API Key",
+                     show="*", height=34, corner_radius=10,
+                     border_color=SIDEBAR_BTN_BORDER).pack(fill="x", padx=16)
         self.model_var = ctk.StringVar(value=self.config.model)
+        row = ctk.CTkFrame(side, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(8, 0))
+        ctk.CTkEntry(row, textvariable=self.model_var, placeholder_text="模型名",
+                     height=34, corner_radius=10, border_color=SIDEBAR_BTN_BORDER).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(row, text="保存", width=56, height=34, corner_radius=10,
+                      fg_color=BRAND, hover_color=BRAND_HOVER, text_color="white",
+                      font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._save_config).pack(side="left", padx=(8, 0))
 
-        self._sidebar_field("API Key")
-        self.key_entry = ctk.CTkEntry(self.sidebar, textvariable=self.key_var, show="*",
-                                      placeholder_text="sk-...", height=32)
-        self.key_entry.pack(fill="x", padx=18, pady=(4, 8))
-
-        self._sidebar_field("模型")
-        ctk.CTkEntry(self.sidebar, textvariable=self.model_var, height=32).pack(fill="x", padx=18, pady=(4, 8))
-
-        ctk.CTkButton(self.sidebar, text="⚙ API 设置（可保存）", height=32, corner_radius=12,
-                      fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER, command=self._open_settings).pack(fill="x", padx=18, pady=(0, 10))
-
-        self._sidebar_field("文档风格")
-        self.style_var = ctk.StringVar(value=STYLE_OPTIONS[0])
-        ctk.CTkComboBox(self.sidebar, values=STYLE_OPTIONS, variable=self.style_var,
-                        state="readonly", height=32).pack(fill="x", padx=18, pady=(4, 8))
-
-        self._sidebar_field("排版标准")
-        self.std_var = ctk.StringVar(value=STD_OPTIONS[0])
-        ctk.CTkComboBox(self.sidebar, values=STD_OPTIONS, variable=self.std_var,
-                        state="readonly", height=32).pack(fill="x", padx=18, pady=(4, 8))
-
-        self._sidebar_field("输出文件夹")
-        self.outdir_var = ctk.StringVar(value=str(self.config.output_dir.resolve()))
-        outdir_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        outdir_row.pack(fill="x", padx=18, pady=(4, 8))
-        ctk.CTkEntry(outdir_row, textvariable=self.outdir_var, height=32, width=120).pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(outdir_row, text="…", width=36, height=32, corner_radius=10,
-                      command=self._browse_dir).pack(side="left", padx=(6, 0))
-
-        # 编辑模式专属（初始隐藏）
-        self.edit_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        self._sidebar_field("要编辑的文件", parent=self.edit_frame)
-        self.file_var = ctk.StringVar(value="")
-        ctk.CTkEntry(self.edit_frame, textvariable=self.file_var, height=32,
-                     placeholder_text="选择 .docx 文件").pack(fill="x", padx=18, pady=(4, 6))
-        ctk.CTkButton(self.edit_frame, text="选择 Word 文档…", height=32, corner_radius=12,
-                      fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER, command=self._browse_file).pack(fill="x", padx=18, pady=(0, 6))
+        # —— 文档偏好 ——
+        section("🎨 文档偏好")
+        self.style_var = ctk.StringVar(value="auto（由 AI 自动选择）")
+        ctk.CTkOptionMenu(side, variable=self.style_var, values=STYLE_OPTIONS,
+                          height=32, corner_radius=10, fg_color=ASSIST_BUBBLE,
+                          text_color=SIDEBAR_BTN_TEXT, button_color=BTN_SOLID,
+                          button_hover_color=BTN_SOLID_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 11)).pack(fill="x", padx=16)
+        self.std_var = ctk.StringVar(value="auto（AI 自动识别）")
+        ctk.CTkOptionMenu(side, variable=self.std_var, values=STD_OPTIONS,
+                          height=32, corner_radius=10, fg_color=ASSIST_BUBBLE,
+                          text_color=SIDEBAR_BTN_TEXT, button_color=BTN_SOLID,
+                          button_hover_color=BTN_SOLID_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 11)).pack(fill="x", padx=16, pady=(8, 0))
+        self.outdir_var = ctk.StringVar(value=str(self.config.output_dir))
+        orow = ctk.CTkFrame(side, fg_color="transparent")
+        orow.pack(fill="x", padx=16, pady=(8, 0))
+        ctk.CTkEntry(orow, textvariable=self.outdir_var, placeholder_text="输出目录",
+                     height=32, corner_radius=10, border_color=SIDEBAR_BTN_BORDER).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(orow, text="📂", width=44, height=32, corner_radius=10,
+                      fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
+                      font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._browse_dir).pack(side="left", padx=(8, 0))
         self.overwrite_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(self.edit_frame, text="覆盖原文件（仍会备份）", variable=self.overwrite_var,
-                        font=ctk.CTkFont("Microsoft YaHei UI", 12)).pack(anchor="w", padx=18, pady=(2, 6))
+        ctk.CTkCheckBox(side, text="编辑时覆盖原文件（默认另存新文件）", variable=self.overwrite_var,
+                        font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                        text_color=SIDEBAR_TEXT, fg_color=BRAND, hover_color=BRAND_HOVER,
+                        checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=16, pady=(10, 0))
 
-        ctk.CTkLabel(self.sidebar, text="常用操作", font=ctk.CTkFont("Microsoft YaHei UI", 12, "bold"),
-                     text_color=SIDEBAR_TEXT).pack(anchor="w", padx=18, pady=(14, 8))
+        # —— 常用操作 ——
+        section("🛠 常用操作")
         for text, cmd in (
-            ("📂 打开输出文件夹", self._open_output_dir),
+            ("📁 打开输出目录", self._open_output_dir),
             ("🕘 最近文档", self._show_recent),
-            ("📄 打开生成的文档", self._open_last_doc),
-            ("🧠 查看记忆", self._show_memory),
-            ("📤 导出日志", self._export_log),
+            ("🧠 上下文记忆", self._show_memory),
+            ("🧹 清空对话", self._clear_chat),
             ("🗑 清空记忆", self._clear_memory),
+            ("📤 导出对话记录", self._export_chat),
         ):
-            ctk.CTkButton(self.sidebar, text=text, height=34, corner_radius=12,
-                          fg_color="transparent", text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
-                          anchor="w", command=cmd).pack(fill="x", padx=12, pady=2)
+            ctk.CTkButton(side, text=text, height=30, corner_radius=9,
+                          fg_color="transparent", border_width=1,
+                          border_color=SIDEBAR_BTN_BORDER, text_color=SIDEBAR_BTN_TEXT,
+                          hover_color=SIDEBAR_BTN_HOVER, anchor="w",
+                          font=ctk.CTkFont("Microsoft YaHei UI", 11), command=cmd).pack(fill="x", padx=16, pady=2)
 
-        # ---------- 右侧主区 ----------
-        main = ctk.CTkFrame(body, fg_color="transparent")
-        main.pack(side="left", fill="both", expand=True, padx=20, pady=18)
+        # —— 底部：主题切换 ——
+        theme_row = ctk.CTkFrame(side, fg_color="transparent")
+        theme_row.pack(side="bottom", fill="x", padx=16, pady=14)
+        mode = ctk.get_appearance_mode().lower()
+        self.theme_btn = ctk.CTkButton(
+            theme_row, text="☀️ 浅色" if mode == "dark" else "🌙 深色",
+            height=34, corner_radius=10, fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
+            font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._toggle_theme)
+        self.theme_btn.pack(fill="x")
+        ctk.CTkLabel(theme_row, text=f"WordAgent {VERSION_LABEL}",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                     text_color=MUTED_TEXT).pack(pady=(8, 0))
 
-        # 指令卡片
-        card = ctk.CTkFrame(main, corner_radius=16)
-        card.pack(fill="both", expand=True, pady=(0, 14))
-        self.prompt_title = ctk.CTkLabel(card, text="✍️ 输入指令", font=ctk.CTkFont("Microsoft YaHei UI", 15, "bold"))
-        self.prompt_title.pack(anchor="w", padx=18, pady=(14, 4))
-        ctk.CTkLabel(card, text="支持自然语言，Ctrl+Enter 快捷执行 · 编辑模式会先预览修改计划，确认后才写入",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 11), text_color=MUTED_TEXT).pack(anchor="w", padx=18)
+    # ---------- 右侧聊天区 ----------
+    def _build_chat(self, body) -> None:
+        col = ctk.CTkFrame(body, fg_color=APP_BG, corner_radius=0)
+        col.grid(row=0, column=1, sticky="nsew")
+        col.grid_columnconfigure(0, weight=1)
+        col.grid_rowconfigure(2, weight=1)
 
-        tpl_row = ctk.CTkFrame(card, fg_color="transparent")
-        tpl_row.pack(anchor="w", padx=18, pady=(6, 0))
-        ctk.CTkLabel(tpl_row, text="快捷模板：", font=ctk.CTkFont("Microsoft YaHei UI", 11),
+        # 对话标题栏
+        chat_head = ctk.CTkFrame(col, fg_color="transparent")
+        chat_head.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
+        ctk.CTkLabel(chat_head, text="💬 对话", font=ctk.CTkFont("Microsoft YaHei UI", 14, "bold"),
+                     text_color=SIDEBAR_BTN_TEXT).pack(side="left")
+        ctk.CTkLabel(chat_head, text="AI 自动识别：生成新文档 / 按模板填写 / 编辑已有文档",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                     text_color=MUTED_TEXT).pack(side="right")
+
+        # 快捷模板 chips
+        chips = ctk.CTkFrame(col, fg_color="transparent")
+        chips.grid(row=1, column=0, sticky="ew", padx=14, pady=(6, 4))
+        ctk.CTkLabel(chips, text="快捷模板：", font=ctk.CTkFont("Microsoft YaHei UI", 11),
                      text_color=MUTED_TEXT).pack(side="left", padx=(0, 6))
-        for label in ("实验报告", "会议纪要", "需求文档", "周报", "数据分析"):
-            ctk.CTkButton(tpl_row, text=label, width=78, height=26, corner_radius=10,
+        for name, prompt in CHIP_PROMPTS:
+            ctk.CTkButton(chips, text=name, height=26, corner_radius=13,
+                          fg_color="transparent", border_width=1,
+                          border_color=SIDEBAR_BTN_BORDER, text_color=SIDEBAR_BTN_TEXT,
+                          hover_color=SIDEBAR_BTN_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                          command=lambda p=prompt: self._use_chip(p)).pack(side="left", padx=4)
+
+        # 聊天滚动区
+        self.chat_scroll = ctk.CTkScrollableFrame(col, corner_radius=0, fg_color="transparent")
+        self.chat_scroll.grid(row=2, column=0, sticky="nsew", padx=14, pady=(2, 4))
+        self.chat_scroll.grid_columnconfigure(0, weight=1)
+        # 底部常驻提示：让聊天区底部始终有信息感，不出现“空灰块”
+        self._scroll_hint = ctk.CTkLabel(self.chat_scroll, text="💡 按 Enter 发送 · Shift+Enter 换行 · 可附 .docx / 图片 / PDF 参考文件",
+                                         font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT)
+        self._scroll_hint.pack(side="bottom", fill="x", pady=(6, 8))
+
+        # 附件栏
+        self.attach_frame = ctk.CTkFrame(col, fg_color="transparent")
+        self.attach_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 0))
+
+        # 输入区（现代聊条样式：高对比圆角容器 + 内部输入框）
+        inp = ctk.CTkFrame(col, fg_color=INPUT_BG, corner_radius=18, border_width=1,
+                           border_color=("#C9D6EE", "#51628A"))
+        inp.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 12))
+        inp.grid_columnconfigure(0, weight=1)
+        self.input_text = ctk.CTkTextbox(inp, height=76, corner_radius=12, border_width=0,
+                                         fg_color="transparent", wrap="word",
+                                         font=ctk.CTkFont("Microsoft YaHei UI", 13))
+        self.input_text.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.input_text.bind("<Return>", self._on_enter)
+        self.input_text.bind("<Shift-Return>", self._on_shift_enter)
+        self.input_text.bind("<FocusIn>", self._on_input_focus_in)
+        self.input_text.bind("<FocusOut>", self._on_input_focus_out)
+        self._set_placeholder()
+
+        brow = ctk.CTkFrame(inp, fg_color="transparent")
+        brow.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        ctk.CTkButton(brow, text="📎 附件", width=92, height=36, corner_radius=12,
+                      fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
+                      text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
+                      font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._pick_files).pack(side="left")
+        ctk.CTkButton(brow, text="🧹 清空对话", width=110, height=36, corner_radius=12,
+                      fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
+                      text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
+                      font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._clear_chat).pack(side="left", padx=8)
+        self.busy_label = ctk.CTkLabel(brow, text="", text_color=MUTED_TEXT,
+                                       font=ctk.CTkFont("Microsoft YaHei UI", 11))
+        self.busy_label.pack(side="right", padx=10)
+        self.send_btn = ctk.CTkButton(brow, text="发送 ⏎", width=120, height=36, corner_radius=12,
+                                      fg_color=BRAND, hover_color=BRAND_HOVER, text_color="white",
+                                      font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold"),
+                                      command=self._send_message)
+        self.send_btn.pack(side="right")
+
+    # ---------- 输入框 / 附件 ----------
+    def _placeholder_color(self) -> str:
+        return "#9AA7BD" if ctk.get_appearance_mode().lower() == "light" else "#5F6B85"
+
+    def _set_placeholder(self) -> None:
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", PLACEHOLDER)
+        self.input_text.configure(text_color=self._placeholder_color())
+
+    def _is_placeholder(self) -> bool:
+        return self.input_text.get("1.0", "end").strip() == PLACEHOLDER.strip()
+
+    def _on_input_focus_in(self, _event=None) -> None:
+        if self._is_placeholder():
+            self.input_text.delete("1.0", "end")
+            self.input_text.configure(text_color=("gray10" if ctk.get_appearance_mode().lower() == "light" else "white"))
+
+    def _on_input_focus_out(self, _event=None) -> None:
+        if not self.input_text.get("1.0", "end").strip():
+            self._set_placeholder()
+
+    def _on_enter(self, _event=None) -> str:
+        self._send_message()
+        return "break"
+
+    def _on_shift_enter(self, _event=None) -> str:
+        self.input_text.insert("insert", "\n")
+        return "break"
+
+    def _use_chip(self, prompt: str) -> None:
+        self.input_text.delete("1.0", "end")
+        self.input_text.insert("1.0", prompt)
+        self.input_text.configure(text_color=("gray10" if ctk.get_appearance_mode().lower() == "light" else "white"))
+        self.input_text.focus_set()
+
+    def _pick_files(self) -> None:
+        if self.busy:
+            return
+        chosen = filedialog.askopenfilenames(
+            title="选择 .docx（待编辑/模板）或参考文件（图片 / PDF / 文本）",
+            filetypes=[
+                ("Word / 图片 / PDF / 文本", "*.docx *.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.pdf *.txt *.csv"),
+                ("Word 文档", "*.docx"),
+                ("图片", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                ("PDF", "*.pdf"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        for f in chosen:
+            if f not in self.attachments:
+                self.attachments.append(f)
+        self._refresh_attach_row()
+
+    def _refresh_attach_row(self) -> None:
+        for child in self.attach_frame.winfo_children():
+            child.destroy()
+        if not self.attachments:
+            return
+        ctk.CTkLabel(self.attach_frame, text="📎 已选择：",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 11), text_color=MUTED_TEXT).pack(side="left", padx=(0, 6))
+        for f in self.attachments:
+            chip = ctk.CTkFrame(self.attach_frame, corner_radius=8, fg_color=ASSIST_BUBBLE)
+            chip.pack(side="left", padx=3, pady=2)
+            ctk.CTkLabel(chip, text=f" {Path(f).name}", font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                         text_color=SIDEBAR_BTN_TEXT).pack(side="left", padx=(8, 2), pady=3)
+            ctk.CTkButton(chip, text="✕", width=22, height=22, corner_radius=6,
+                          fg_color="transparent", hover_color=ERROR_TEXT,
+                          text_color=MUTED_TEXT, font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                          command=lambda fp=f: self._remove_file(fp)).pack(side="left", padx=(2, 6))
+        if len(self.attachments) > 1:
+            ctk.CTkButton(self.attach_frame, text="全部清除", width=70, height=24, corner_radius=8,
                           fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
                           text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
-                          font=ctk.CTkFont("Microsoft YaHei UI", 11),
-                          command=lambda t=label: self._fill_template(t)).pack(side="left", padx=3)
+                          font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                          command=self._clear_files).pack(side="left", padx=6)
 
-        self.input_text = ctk.CTkTextbox(card, height=150, corner_radius=12,
-                                         font=ctk.CTkFont("Microsoft YaHei UI", 13))
-        self.input_text.pack(fill="both", expand=True, padx=18, pady=12)
-        self.input_text.bind("<Control-Return>", lambda _e: self._run())
-        self.input_text.bind("<FocusIn>", lambda _e: self._on_input_focus_in())
-        self.input_text.bind("<FocusOut>", lambda _e: self._on_input_focus_out())
-        self._set_placeholder(PLACEHOLDER_GEN)
-        self._apply_caret_color()
+    def _remove_file(self, path: str) -> None:
+        if path in self.attachments:
+            self.attachments.remove(path)
+        self._refresh_attach_row()
 
-        # 参考文件行（docx 会自动作为模板：格式与章节结构按它来）
-        attach_row = ctk.CTkFrame(main, fg_color="transparent")
-        attach_row.pack(fill="x", pady=(0, 10))
-        self.fill_tpl_var = ctk.BooleanVar(value=False)
-        self.fill_tpl_cb = ctk.CTkCheckBox(main, text="📝 按模板填写（在 docx 模板里填内容，格式完全继承模板；需添加 docx 作为参考文件）",
-                                           variable=self.fill_tpl_var,
-                                           font=ctk.CTkFont("Microsoft YaHei UI", 11),
-                                           text_color=SIDEBAR_TEXT)
-        self.fill_tpl_cb.pack(anchor="w", pady=(0, 8))
-        self.attach_label = ctk.CTkLabel(attach_row, text="📎 参考文件：无（docx=按模板填写；图片/PDF=自动识别模板结构）",
-                                         font=ctk.CTkFont("Microsoft YaHei UI", 11),
-                                         text_color=SIDEBAR_TEXT, anchor="w")
-        self.attach_label.pack(side="left", fill="x", expand=True)
-        self.attach_add_btn = ctk.CTkButton(attach_row, text="添加文件…", width=104, height=30,
-                                            corner_radius=12, fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
-                                            font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._browse_refs)
-        self.attach_add_btn.pack(side="right", padx=(6, 0))
-        self.attach_clear_btn = ctk.CTkButton(attach_row, text="清空", width=64, height=30, corner_radius=12,
-                                              fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
-                                              text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
-                                              font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._clear_refs)
-        self.attach_clear_btn.pack(side="right")
+    def _clear_files(self) -> None:
+        self.attachments = []
+        self._refresh_attach_row()
 
-        # 执行按钮行
-        act_row = ctk.CTkFrame(main, fg_color="transparent")
-        act_row.pack(fill="x", pady=(0, 12))
-        self.run_btn = ctk.CTkButton(act_row, text="🚀 生成 Word 文档", height=46, corner_radius=14,
-                                     font=ctk.CTkFont("Microsoft YaHei UI", 15, "bold"),
-                                     fg_color=BRAND, hover_color=BRAND_HOVER,
-                                     command=self._run)
-        self.run_btn.pack(side="left")
-        ctk.CTkLabel(act_row, text="  重要文件自动备份，默认另存新文件，安全第一",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 12), text_color=SIDEBAR_TEXT).pack(side="left")
+    # ================= 意图识别与发送 =================
+    def _detect_intent(self, text: str, files: list[str]):
+        """自动判断需求类型：fill（按模板填写）/ edit（编辑已有文档）/ generate（生成新文档）。"""
+        docx = next((f for f in files if str(f).lower().endswith(".docx")), None)
+        others = [f for f in files if f != docx]
+        if docx:
+            if any(k in text for k in FILL_KEYWORDS):
+                return "fill", docx, others, "📋 检测到模板文件，将按模板结构填写内容。"
+            if any(k in text for k in STRONG_EDIT) or any(k in text for k in WEAK_EDIT):
+                return "edit", docx, others, "📄 检测到 .docx 与修改要求，将先读取文档内容再精准修改。"
+            return "generate", None, [docx] + others, "📄 已把 .docx 作为模板参考（如需修改/填写，请加上“修改/填写”等词）。"
+        if any(k in text for k in STRONG_EDIT):
+            return "need_doc", None, files, "看起来你想编辑文档：请先点「📎 附件」添加要编辑的 .docx，再发送这条要求。"
+        return "generate", None, files, ""
 
-        # 状态 + 进度
-        status_row = ctk.CTkFrame(main, fg_color="transparent")
-        status_row.pack(fill="x", pady=(0, 6))
-        self.status_var = ctk.StringVar(value="就绪。")
-        ctk.CTkLabel(status_row, textvariable=self.status_var,
-                     font=ctk.CTkFont("Microsoft YaHei UI", 12, "bold")).pack(side="left")
-        self.progress = ctk.CTkProgressBar(main, height=8, corner_radius=4, progress_color=BRAND)
-        self.progress.pack(fill="x", pady=(0, 14))
-        self.progress.set(0)
-
-        # 日志卡片
-        log_card = ctk.CTkFrame(main, corner_radius=16)
-        log_card.pack(fill="both", expand=True)
-        ctk.CTkLabel(log_card, text="📋 运行日志", font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=18, pady=(12, 6))
-        self.log_text = ctk.CTkTextbox(log_card, corner_radius=12, height=170,
-                                       font=ctk.CTkFont("Consolas", 11), state="disabled",
-                                       fg_color=LOG_BG, text_color=LOG_TEXT)
-        self.log_text.pack(fill="both", expand=True, padx=18, pady=(0, 14))
-        self._apply_caret_color()
-
-    def _mode_button(self, text: str, row: int, command) -> ctk.CTkButton:
-        btn = ctk.CTkButton(self.sidebar, text=text, height=44, corner_radius=12,
-                            font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold"),
-                            fg_color=BRAND, hover_color=BRAND_HOVER,
-                            anchor="w", command=command)
-        btn.pack(fill="x", padx=12, pady=3)
-        return btn
-
-    def _sidebar_field(self, text: str, parent=None) -> None:
-        container = parent or self.sidebar
-        ctk.CTkLabel(container, text=text, font=ctk.CTkFont("Microsoft YaHei UI", 11),
-                     text_color=SIDEBAR_TEXT).pack(anchor="w", padx=18, pady=(2, 0))
-
-    def _on_theme_change(self, value: str) -> None:
-        ctk.set_appearance_mode("dark" if value == "深色" else "light")
-        self.memory.set_setting("theme", "dark" if value == "深色" else "light")
-        self._refresh_placeholder_color()
-        self._apply_caret_color()
-
-    def _apply_saved_theme(self) -> None:
-        """把记忆中的主题同步到右上角下拉框（在 _build_ui 之后调用一次）。"""
-        if getattr(self, "_theme_initialized", False):
+    def _send_message(self) -> None:
+        if self.busy:
+            self._set_status("⏳ 正在处理上一条消息，请稍候…")
             return
-        self._theme_initialized = True
-        saved = self.memory.get_setting("theme", "")
+        text = self.input_text.get("1.0", "end").strip()
+        if self._is_placeholder():
+            text = ""
+        if not text:
+            self._set_status("请先输入文档要求。")
+            return
+        key = self.key_var.get().strip() or self.config.api_key
+        if not key:
+            messagebox.showwarning(
+                "缺少 API Key",
+                "请先在左侧填写 DeepSeek API Key 并点「保存」。\n\n也可以在工作目录创建 .env 文件：\nDEEPSEEK_API_KEY=sk-xxx",
+            )
+            return
+        self.config.api_key = key
+        self.config.model = self.model_var.get().strip() or self.config.model
+
+        self.input_text.delete("1.0", "end")
+        files = list(self.attachments)
+        self.attachments = []
+        self._refresh_attach_row()
+        self._add_user_bubble(text, files)
+        self.chat_history.append({"role": "user", "text": text, "files": files})
+
+        kind, target, refs, note = self._detect_intent(text, files)
+        if kind == "need_doc":
+            self._add_assist_bubble(note)
+            return
+        if note:
+            self._add_system_bubble(note)
+        mid = self._add_assist_bubble("⏳ 正在解析你的要求…")
+        self._current_mid = mid
+        self._started_at = time.time()
+        self._set_busy(True)
+        threading.Thread(target=self._worker_chat,
+                         args=(kind, text, mid, target, refs), daemon=True).start()
+        self.input_text.focus_set()
+
+    def _set_busy(self, busy: bool, status: str = "") -> None:
+        self.busy = busy
+        self.send_btn.configure(state="disabled" if busy else "normal")
+        self.busy_label.configure(text="处理中…" if busy else "")
+        if status:
+            self._set_status(status)
+
+    def _set_status(self, text: str) -> None:
+        self.header_status.configure(text=text)
+
+    # ================= Worker（后台线程） =================
+    def _worker_chat(self, kind: str, text: str, mid: int, target: str | None, refs: list[str]) -> None:
+        def log(msg: str) -> None:
+            self.events.put(("bubble_text", mid, msg))
+
+        try:
+            llm = LLMClient(self.config)
+            if kind == "generate":
+                style_override = None
+                sr = self.style_var.get()
+                if not sr.startswith("auto"):
+                    style_override = sr.split("（")[0]
+                standard_override = None
+                sr2 = self.std_var.get()
+                if not sr2.startswith("auto"):
+                    standard_override = sr2.split("（")[0]
+                output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+                path = run_pipeline(text, self.config, self.memory, log=log,
+                                    style_override=style_override, standard_override=standard_override,
+                                    output_dir_override=output_dir, reference_files=refs,
+                                    llm=llm, confirm_plan=self._request_plan_confirm)
+                if path is None:
+                    self.events.put(("cancelled", mid))
+                    return
+                usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
+                self.events.put(("done_generate", str(path), mid, usage))
+            elif kind == "edit":
+                output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+                state = prepare_edit(Path(target), text, self.config, self.memory,
+                                     llm=llm, log=log, reference_files=refs)
+                self.events.put(("edit_plan", state, mid))
+                if not self._wait_edit_confirm():
+                    self.events.put(("cancelled", mid))
+                    return
+                path = finalize_edit(self._edit_state, self.config, self.memory,
+                                     output_dir=output_dir, save_as_new=not self.overwrite_var.get(),
+                                     log=log, resolve_ambiguous=self._resolve_ambiguous,
+                                     on_warnings=self._on_warnings)
+                usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
+                self.events.put(("done_edit", str(path), mid, usage))
+            elif kind == "fill":
+                path = fill_template(Path(target), text, self.config, self.memory, llm=llm, log=log)
+                usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
+                self.events.put(("done_generate", str(path), mid, usage))
+        except (LLMError, Exception) as exc:  # noqa: BLE001
+            self.events.put(("error", str(exc), mid))
+
+    def _request_plan_confirm(self, plan: dict) -> bool:
+        """后台线程调用：把大纲渲染进聊天区，阻塞等待用户点「确认 / 取消」。"""
+        evt = threading.Event()
+        self._plan_evt = evt
+        self._plan_ok = False
+        self.events.put(("plan_show", plan))
+        evt.wait()
+        return self._plan_ok
+
+    def _wait_edit_confirm(self) -> bool:
+        evt = threading.Event()
+        self._edit_evt = evt
+        self._edit_ok = False
+        evt.wait()
+        return self._edit_ok
+
+    # ================= 聊天气泡 =================
+    def _new_mid(self) -> int:
+        self._mid += 1
+        return self._mid
+
+    def _scroll_bottom(self) -> None:
+        try:
+            self.chat_scroll.update_idletasks()
+            self.chat_scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    def _add_user_bubble(self, text: str, files: list[str]) -> int:
+        mid = self._new_mid()
+        outer = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        outer.pack(fill="x", pady=(10, 2), padx=10, before=getattr(self, "_scroll_hint", None))
+        inner = ctk.CTkFrame(outer, fg_color=USER_BUBBLE, corner_radius=14)
+        ctk.CTkLabel(inner, text=text, justify="left", anchor="w", wraplength=640,
+                     font=ctk.CTkFont("Microsoft YaHei UI", 13),
+                     text_color=("white", "white")).pack(anchor="e", padx=12, pady=(8, 4))
+        for f in files[:5]:
+            ctk.CTkLabel(inner, text=f"📎 {Path(f).name}", anchor="w", justify="left",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                         text_color=("#EAF1FF", "#EAF1FF")).pack(anchor="e", padx=12, pady=1)
+        if len(files) > 5:
+            ctk.CTkLabel(inner, text=f"… 共 {len(files)} 个文件", anchor="w",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                         text_color=("#D5E1F5", "#D5E1F5")).pack(anchor="e", padx=12, pady=1)
+        ctk.CTkLabel(outer, text=time.strftime("%H:%M"), anchor="e",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 9), text_color=MUTED_TEXT).pack(anchor="e", padx=6, pady=(2, 0))
+        inner.pack(anchor="e")
+        self._bubbles[mid] = [outer, None, inner]
+        self._scroll_bottom()
+        return mid
+
+    def _add_assist_bubble(self, text: str, mid: int | None = None) -> int:
+        if mid is None:
+            mid = self._new_mid()
+        outer = ctk.CTkFrame(self.chat_scroll, fg_color="transparent")
+        outer.pack(fill="x", pady=(10, 2), padx=10, before=getattr(self, "_scroll_hint", None))
+        ctk.CTkLabel(outer, text=f"WordAgent · {time.strftime('%H:%M')}", anchor="w",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 9), text_color=MUTED_TEXT).pack(anchor="w", padx=6, pady=(0, 2))
+        inner = ctk.CTkFrame(outer, fg_color=ASSIST_BUBBLE, corner_radius=14)
+        label = ctk.CTkLabel(inner, text=text, justify="left", anchor="w", wraplength=680,
+                             font=ctk.CTkFont("Microsoft YaHei UI", 13),
+                             text_color=SIDEBAR_BTN_TEXT)
+        label.pack(anchor="w", padx=12, pady=8)
+        inner.pack(anchor="w")
+        self._bubbles[mid] = [outer, label, inner]
+        self._scroll_bottom()
+        return mid
+
+    def _add_system_bubble(self, text: str) -> None:
+        ctk.CTkLabel(self.chat_scroll, text=text, justify="center", anchor="center",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT,
+                     wraplength=720).pack(fill="x", pady=4, padx=10, before=getattr(self, "_scroll_hint", None))
+
+    def _set_bubble_text(self, mid: int, text: str) -> None:
+        entry = self._bubbles.get(mid)
+        if entry and entry[1] is not None:
+            entry[1].configure(text=text)
+            self._scroll_bottom()
+
+    def _bubble_add_buttons(self, mid: int, buttons: list) -> None:
+        """在气泡底部追加按钮行。buttons: [(text, fg, hover, command)]"""
+        entry = self._bubbles.get(mid)
+        if not entry:
+            return
+        inner = entry[2]
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        for text, fg, hover, cmd in buttons:
+            ctk.CTkButton(row, text=text, height=32, corner_radius=10,
+                          fg_color=fg, hover_color=hover, text_color="white",
+                          font=ctk.CTkFont("Microsoft YaHei UI", 12),
+                          command=cmd).pack(side="left", padx=4, pady=4)
+        row.pack(anchor="w", padx=10, pady=(2, 8))
+        self._scroll_bottom()
+
+    # ================= 计划 / 结果渲染 =================
+    def _render_plan_bubble(self, plan: dict) -> None:
+        mid = self._current_mid or self._new_mid()
+        style_label = {"business": "商务", "report": "报告", "academic": "学术",
+                       "creative": "创意文案", "default": "通用"}.get(plan.get("style"), "通用")
+        lines = [f"📋 大纲预览｜标题：{plan.get('title', '')}",
+                 f"风格：{style_label}　|　目录：{'是' if plan.get('toc') else '否'}"]
+        sections = plan.get("sections") or []
+        if sections:
+            lines.append("")
+            for sec in sections:
+                indent = "　　" * (max(0, int(sec.get("level", 1)) - 1))
+                lines.append(f"{indent}· {sec.get('heading', '')}")
+        lines.append("")
+        lines.append("确认大纲后生成正文；不满意可直接取消，回到输入框补充要求后重试。")
+        self._set_bubble_text(mid, "\n".join(lines))
+
+        def ok() -> None:
+            self._plan_ok = True
+            if self._plan_evt:
+                self._plan_evt.set()
+
+        def cancel() -> None:
+            self._plan_ok = False
+            if self._plan_evt:
+                self._plan_evt.set()
+
+        self._bubble_add_buttons(mid, [
+            ("✓ 按此大纲生成", GREEN, GREEN_HOVER, ok),
+            ("✕ 取消修改指令", BTN_SOLID, BTN_SOLID_HOVER, cancel),
+        ])
+
+    def _render_edit_plan(self, state: dict, mid: int) -> None:
+        plan = state.get("plan") or {}
+        ops = plan.get("operations") or []
+        lines = [f"📋 已读取《{Path(str(state['src'])).name}》，修改计划："]
+        if plan.get("summary"):
+            lines.append(f"　说明：{plan['summary']}")
+        lines.append(f"　共 {len(ops)} 项操作：")
+        for op in ops[:12]:
+            target = str(op.get("target", ""))[:42]
+            extra = op.get("new_text") or op.get("style") or ""
+            tail = f" → {str(extra)[:30]}" if extra else ""
+            lines.append(f"　· [{op.get('op', '?')}]「{target}」{tail}")
+        if len(ops) > 12:
+            lines.append(f"　… 其余 {len(ops) - 12} 项操作保存时一并应用")
+        lines.append("")
+        lines.append("确认后开始修改（原文件自动备份）；取消则不做任何改动。")
+        self._set_bubble_text(mid, "\n".join(lines))
+
+        def ok() -> None:
+            self._edit_state = state
+            self._edit_ok = True
+            if self._edit_evt:
+                self._edit_evt.set()
+
+        def cancel() -> None:
+            self._edit_ok = False
+            if self._edit_evt:
+                self._edit_evt.set()
+
+        self._bubble_add_buttons(mid, [
+            ("✓ 确认修改", GREEN, GREEN_HOVER, ok),
+            ("✕ 取消", BTN_SOLID, BTN_SOLID_HOVER, cancel),
+        ])
+
+    def _finish_ok(self, path: str, mid: int, action: str, usage: str = "") -> None:
+        self.last_output = Path(path)
+        used = f"\n\n⚙ {usage}" if usage else ""
+        elapsed = time.time() - self._started_at if self._started_at else 0
+        self._set_bubble_text(
+            mid,
+            f"✅ {action}完成（用时 {elapsed:.0f} 秒），文档已保存：\n{path}{used}\n\n"
+            "💡 继续对我说「把标题改成…」「再加一节结论…」即可接着修改。",
+        )
+        self._bubble_add_buttons(mid, [
+            ("📄 打开文档", BRAND, BRAND_HOVER, lambda: self._open_path(Path(path))),
+            ("📂 所在文件夹", BTN_SOLID, BTN_SOLID_HOVER, lambda: self._open_folder_of(Path(path))),
+        ])
+        self.chat_history.append({"role": "assistant", "text": f"[{action}完成] {path}"})
+        self._set_busy(False)
+        self._set_status(f"✔ {action}完成")
+
+    def _finish_error(self, message: str, mid: int) -> None:
+        self._set_bubble_text(mid, f"❌ 操作失败：\n{message}")
+        entry = self._bubbles.get(mid)
+        if entry and entry[1] is not None:
+            entry[1].configure(text_color=ERROR_TEXT)
+        self._set_busy(False)
+        self._set_status("✖ 操作失败")
+
+    def _handle_cancelled(self, mid: int) -> None:
+        self._set_bubble_text(mid, "已取消：未生成 / 未修改文档。")
+        self._set_busy(False)
+        self._set_status("已取消")
+
+    # ================= 事件轮询 =================
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                item = self.events.get_nowait()
+                kind = item[0]
+                if kind == "bubble_text":
+                    self._set_bubble_text(item[1], item[2])
+                elif kind == "plan_show":
+                    self._render_plan_bubble(item[1])
+                elif kind == "edit_plan":
+                    self._render_edit_plan(item[1], item[2])
+                elif kind == "cancelled":
+                    self._handle_cancelled(item[1])
+                elif kind == "done_generate":
+                    self._finish_ok(item[1], item[2], "生成", item[3] if len(item) > 3 else "")
+                elif kind == "done_edit":
+                    self._finish_ok(item[1], item[2], "修改", item[3] if len(item) > 3 else "")
+                elif kind == "error":
+                    self._finish_error(item[1], item[2])
+        except queue.Empty:
+            pass
+        self.root.after(120, self._poll_events)
+
+    # ================= 编辑期阻塞弹窗 =================
+    def _resolve_ambiguous(self, op: dict, candidates: list[str]) -> str | None:
+        """目标有歧义时弹窗让用户选择（主线程展示，阻塞等待）。"""
+        result: list[str | None] = [None]
+        evt = threading.Event()
+
+        def _show() -> None:
+            win = ctk.CTkToplevel(self.root)
+            win.title("目标匹配到多个位置")
+            win.geometry("640x420")
+            win.transient(self.root)
+            win.grab_set()
+            ctk.CTkLabel(win, text=f"指令「{str(op.get('target', ''))[:40]}」匹配到多个段落，请选择：",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
+            box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
+            box.pack(fill="both", expand=True, padx=18, pady=10)
+            for i, cand in enumerate(candidates[:6], 1):
+                box.insert("end", f"{i}. {cand}\n")
+            box.configure(state="disabled")
+            entry = ctk.CTkEntry(win, placeholder_text="输入序号后点确认（回车=取消）", height=34)
+            entry.pack(fill="x", padx=18)
+            entry.bind("<Return>", lambda e: _confirm())
+
+            def _confirm() -> None:
+                ans = entry.get().strip()
+                if ans.isdigit() and 1 <= int(ans) <= len(candidates[:6]):
+                    result[0] = candidates[:6][int(ans) - 1]
+                evt.set()
+                win.destroy()
+
+            def _cancel() -> None:
+                evt.set()
+                win.destroy()
+
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=(10, 16))
+            ctk.CTkButton(row, text="✓ 确认", width=110, height=36, corner_radius=12,
+                          fg_color=GREEN, hover_color=GREEN_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_confirm).pack(side="left")
+            ctk.CTkButton(row, text="✕ 取消", width=100, height=36, corner_radius=12,
+                          fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_cancel).pack(side="left", padx=10)
+
+        self.root.after(0, _show)
+        evt.wait()
+        return result[0]
+
+    def _on_warnings(self, issues: list[str]) -> bool:
+        """结构校验有风险时弹窗询问是否继续（阻塞等待用户选择）。"""
+        result: list[bool] = [False]
+        evt = threading.Event()
+
+        def _show() -> None:
+            win = ctk.CTkToplevel(self.root)
+            win.title("结构校验风险")
+            win.geometry("620x380")
+            win.transient(self.root)
+            win.grab_set()
+            ctk.CTkLabel(win, text="⚠ 结构校验发现以下风险：",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
+            box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
+            box.pack(fill="both", expand=True, padx=18, pady=10)
+            for issue in issues:
+                box.insert("end", f"· {issue}\n")
+            box.insert("end", "\n仍要继续保存吗？原文件不会受影响（会自动备份）。")
+            box.configure(state="disabled")
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(fill="x", padx=18, pady=(10, 16))
+
+            def _yes() -> None:
+                result[0] = True
+                evt.set()
+                win.destroy()
+
+            def _no() -> None:
+                evt.set()
+                win.destroy()
+
+            ctk.CTkButton(row, text="✓ 继续保存", width=120, height=36, corner_radius=12,
+                          fg_color=GREEN, hover_color=GREEN_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_yes).pack(side="left")
+            ctk.CTkButton(row, text="✕ 取消", width=100, height=36, corner_radius=12,
+                          fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_no).pack(side="left", padx=10)
+
+        self.root.after(0, _show)
+        evt.wait()
+        return result[0]
+
+    # ================= 主题 / 配置 =================
+    def _toggle_theme(self) -> None:
         mode = ctk.get_appearance_mode().lower()
-        if saved == "dark" or (not saved and mode == "dark"):
-            self.theme_menu.set("深色")
-            self._refresh_placeholder_color()
-            self._apply_caret_color()
+        new = "light" if mode == "dark" else "dark"
+        ctk.set_appearance_mode(new)
+        self.memory.set_setting("theme", new)
+        self.theme_btn.configure(text="☀️ 浅色" if new == "dark" else "🌙 深色")
+        self._apply_caret_color()
+        self._refresh_placeholder_color()
+
+    def _refresh_placeholder_color(self) -> None:
+        if self._is_placeholder():
+            self.input_text.configure(text_color=self._placeholder_color())
 
     def _apply_caret_color(self) -> None:
-        """设置文本光标颜色：浅色主题用深色光标，深色主题用浅色光标，覆盖全部文本框（含弹窗）。"""
         color = "#1F2937" if ctk.get_appearance_mode().lower() == "light" else "#FFFFFF"
 
         def walk(widget) -> None:
@@ -322,150 +840,17 @@ class WordAgentApp:
 
         walk(self.root)
 
-    # ---------- 指令框占位符（CTkTextbox 不支持原生 placeholder） ----------
-    def _placeholder_color(self) -> str:
-        return "#9AA7BD" if ctk.get_appearance_mode().lower() == "light" else "#5F6B85"
-
-    def _set_placeholder(self, text: str) -> None:
-        self.input_text.delete("1.0", "end")
-        self.input_text.insert("1.0", text)
-        self.input_text.configure(text_color=self._placeholder_color())
-
-    def _current_placeholder(self) -> str:
-        return PLACEHOLDER_EDIT if self.mode_var == "edit" else PLACEHOLDER_GEN
-
-    def _is_placeholder(self) -> bool:
-        return self.input_text.get("1.0", "end").strip() == self._current_placeholder().strip()
-
-    def _refresh_placeholder_color(self) -> None:
-        if self._is_placeholder():
-            self.input_text.configure(text_color=self._placeholder_color())
-
-    def _on_input_focus_in(self) -> None:
-        if self._is_placeholder():
-            self.input_text.delete("1.0", "end")
-            self.input_text.configure(text_color=("gray10" if ctk.get_appearance_mode().lower() == "light" else "white"))
-
-    def _on_input_focus_out(self) -> None:
-        if not self.input_text.get("1.0", "end").strip():
-            self._set_placeholder(self._current_placeholder())
-
-    # ================= 模式切换 =================
-    def _set_mode(self, mode: str) -> None:
-        self.mode_var = mode
-        if mode == "edit":
-            # 编辑模式也支持参考文件（作为格式/数据/要求依据）
-            self.fill_tpl_cb.configure(state="disabled")
-            self._refresh_attach_label_edit()
-            self.mode_gen_btn.configure(fg_color="transparent", text_color=SIDEBAR_BTN_TEXT,
-                                        hover_color=SIDEBAR_BTN_HOVER, border_width=1, border_color=SIDEBAR_BTN_BORDER)
-            self.mode_edit_btn.configure(fg_color=BRAND, text_color="#FFFFFF",
-                                         hover_color=BRAND_HOVER, border_width=0)
-            self.edit_frame.pack(fill="x", pady=(4, 0))
-            self.prompt_title.configure(text="✍️ 输入修改要求")
-            self.run_btn.configure(text="📝 生成修改计划")
-            if self._is_placeholder() or not self.input_text.get("1.0", "end").strip():
-                self._set_placeholder(PLACEHOLDER_EDIT)
-            self.status_var.set("编辑模式：选择文件并输入修改要求。")
-        else:
-            self.attach_add_btn.configure(state="normal")
-            self.attach_clear_btn.configure(state="normal")
-            self.fill_tpl_cb.configure(state="normal")
-            self._refresh_attach_label()
-            self.mode_edit_btn.configure(fg_color="transparent", text_color=SIDEBAR_BTN_TEXT,
-                                         hover_color=SIDEBAR_BTN_HOVER, border_width=1, border_color=SIDEBAR_BTN_BORDER)
-            self.mode_gen_btn.configure(fg_color=BRAND, text_color="#FFFFFF",
-                                        hover_color=BRAND_HOVER, border_width=0)
-            self.edit_frame.pack_forget()
-            self.prompt_title.configure(text="✍️ 输入指令")
-            self.run_btn.configure(text="🚀 生成 Word 文档")
-            if self._is_placeholder() or not self.input_text.get("1.0", "end").strip():
-                self._set_placeholder(PLACEHOLDER_GEN)
-            self.status_var.set("生成模式：输入需求即可。")
-
-    def _switch_generate(self) -> None:
-        if not self.busy:
-            self._set_mode("generate")
-
-    def _switch_edit(self) -> None:
-        if not self.busy:
-            self._set_mode("edit")
-
-    # ================= 动作 =================
-    # ================= API 设置（持久化到 .env） =================
-    def _open_settings(self) -> None:
-        win = ctk.CTkToplevel(self.root)
-        win.title("API 设置")
-        win.geometry("440x640")
-        win.resizable(False, False)
-        win.transient(self.root)
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="接口设置（保存后写入 .env，重启仍生效）",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 14, "bold"),
-                     text_color=BRAND_DARK).pack(anchor="w", padx=24, pady=(18, 10))
-
-        def field(label: str) -> ctk.CTkEntry:
-            ctk.CTkLabel(win, text=label, font=ctk.CTkFont("Microsoft YaHei UI", 12),
-                         text_color=MUTED_TEXT).pack(anchor="w", padx=24)
-            e = ctk.CTkEntry(win, height=32)
-            e.pack(fill="x", padx=24, pady=(3, 8))
-            return e
-
-        key_entry = field("API Key")
-        key_entry.insert(0, self.config.api_key)
-        url_entry = field("接口地址 Base URL")
-        url_entry.insert(0, self.config.base_url)
-        model_entry = field("模型名称")
-        model_entry.insert(0, self.config.model)
-        temp_entry = field("温度 (0-2，越高越有创造性)")
-        temp_entry.insert(0, str(self.config.temperature))
-        timeout_entry = field("请求超时（秒）")
-        timeout_entry.insert(0, str(self.config.request_timeout))
-        concurrency_entry = field("并发数（1-8）")
-        concurrency_entry.insert(0, str(self.config.concurrency))
-        max_tokens_entry = field("单次输出上限 max_tokens（推理模型建议 8192-32768）")
-        max_tokens_entry.insert(0, str(self.config.max_tokens))
-
-        status = ctk.CTkLabel(win, text="", font=ctk.CTkFont("Microsoft YaHei UI", 12), text_color="#C0392B")
-        status.pack(anchor="w", padx=24)
-
-        def save() -> None:
-            try:
-                key = key_entry.get().strip()
-                url = url_entry.get().strip().rstrip("/")
-                model = model_entry.get().strip()
-                temperature = float(temp_entry.get().strip())
-                timeout = int(timeout_entry.get().strip())
-                concurrency = max(1, min(8, int(concurrency_entry.get().strip())))
-                max_tokens = max(1024, min(32768, int(max_tokens_entry.get().strip())))
-            except ValueError:
-                status.configure(text="⚠ 数字格式不正确，请检查温度/超时/并发/max_tokens")
-                return
-            if not key or not url or not model:
-                status.configure(text="⚠ API Key、接口地址、模型不能为空")
-                return
-            self._persist_env({
-                "DEEPSEEK_API_KEY": key,
-                "DEEPSEEK_BASE_URL": url,
-                "DEEPSEEK_MODEL": model,
-                "DEEPSEEK_TEMPERATURE": f"{temperature:g}",
-                "DEEPSEEK_TIMEOUT": str(timeout),
-                "DEEPSEEK_CONCURRENCY": str(concurrency),
-                "DEEPSEEK_MAX_TOKENS": str(max_tokens),
-            })
-            self.config = Config.from_env()
-            self.key_var.set(self.config.api_key)
-            self.model_var.set(self.config.model)
-            self._log("✓ API 设置已保存到 .env")
-            win.destroy()
-
-        row = ctk.CTkFrame(win, fg_color="transparent")
-        row.pack(fill="x", padx=24, pady=(6, 18))
-        ctk.CTkButton(row, text="保存设置", width=120, height=36, corner_radius=12,
-                      fg_color=BRAND, hover_color=BRAND_HOVER, command=save).pack(side="left")
-        ctk.CTkButton(row, text="取消", width=90, height=36, corner_radius=12,
-                      fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER, command=win.destroy).pack(side="left", padx=(10, 0))
+    def _save_config(self) -> None:
+        key = self.key_var.get().strip()
+        model = self.model_var.get().strip()
+        if not key:
+            messagebox.showwarning("提示", "API Key 不能为空。")
+            return
+        self.config.api_key = key
+        self.config.model = model or self.config.model
+        self._persist_env({"DEEPSEEK_API_KEY": key, "DEEPSEEK_MODEL": self.config.model})
+        self._set_status(f"✔ 已保存配置（{self.config.model}）")
+        self._add_system_bubble(f"🔑 配置已保存：{self.config.model}")
 
     def _persist_env(self, updates: dict[str, str]) -> None:
         # 安装版（PyInstaller 冻结）运行时 .env 位于程序目录；开发版在 cwd
@@ -488,93 +873,33 @@ class WordAgentApp:
                 out.append(f"{k}={v}")
         path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
+    # ================= 常用操作 =================
     def _browse_dir(self) -> None:
         chosen = filedialog.askdirectory(initialdir=self.outdir_var.get() or str(Path.cwd()))
         if chosen:
             self.outdir_var.set(chosen)
 
-    def _browse_file(self) -> None:
-        chosen = filedialog.askopenfilename(
-            title="选择要编辑的 Word 文档",
-            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")],
-        )
-        if chosen:
-            self.file_var.set(chosen)
-
-    def _browse_refs(self) -> None:
-        chosen = filedialog.askopenfilenames(
-            title="选择参考文件（图片/文本/csv/docx）",
-            filetypes=[
-                ("常用参考文件", "*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.txt;*.md;*.csv;*.log;*.docx"),
-                ("图片", "*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif"),
-                ("文本", "*.txt;*.md;*.csv;*.log;*.json"),
-                ("Word 文档", "*.docx"),
-                ("所有文件", "*.*"),
-            ],
-        )
-        for f in chosen:
-            if f not in self.ref_files:
-                self.ref_files.append(f)
-        if chosen:
-            self._refresh_attach_label()
-            self._log(f"📎 已添加 {len(chosen)} 个参考文件（共 {len(self.ref_files)} 个）")
-
-    def _clear_refs(self) -> None:
-        self.ref_files = []
-        self._refresh_attach_label()
-        self._log("📎 已清空参考文件。")
-
-    def _refresh_attach_label(self) -> None:
-        if not self.ref_files:
-            self.attach_label.configure(text="📎 参考文件：无（docx=按模板填写；图片/PDF=自动识别模板结构）")
-            return
-        names = "、".join(Path(f).name for f in self.ref_files)
-        if len(names) > 46:
-            names = names[:43] + "…"
-        self.attach_label.configure(text=f"📎 参考文件：{names}（{len(self.ref_files)} 个）")
-
-    def _refresh_attach_label_edit(self) -> None:
-        if not self.ref_files:
-            self.attach_label.configure(text="📎 参考文件：可选（修改时结合参考格式/数据）")
-            return
-        names = "、".join(Path(f).name for f in self.ref_files)
-        if len(names) > 46:
-            names = names[:43] + "…"
-        self.attach_label.configure(text=f"📎 参考文件：{names}（{len(self.ref_files)} 个，修改时结合）")
-
-    def _fill_template(self, kind: str) -> None:
-        templates = {
-            "实验报告": "请写一份《XX 实验报告》：主题为 ______，包含实验目的、实验原理、实验环境与器材、"
-                       "实验步骤、数据记录（用表格）、结果分析、误差分析、实验结论，数据要定量。",
-            "会议纪要": "请写一份《XX 会议纪要》：包含会议基本信息（时间/地点/参会人）、议题与讨论要点、"
-                       "决议事项、待办任务表格（事项/负责人/截止时间）。",
-            "需求文档": "请写一份《XX 产品需求文档》，商务风格：背景与目标、用户与场景、功能需求（表格+优先级）、"
-                       "非功能需求、里程碑与验收标准。",
-            "周报": "请写一份本周工作周报：本周工作进展（分条）、关键数据（表格）、问题与风险、下周计划。",
-            "数据分析": "请写一份《XX 数据分析报告》：数据概览（表格）、关键发现、分维度分析、结论与建议。",
-        }
-        text = templates.get(kind, "")
-        if not text:
-            return
-        self.input_text.delete("1.0", "end")
-        self.input_text.insert("1.0", text)
-        self.input_text.configure(text_color=("gray10" if ctk.get_appearance_mode().lower() == "light" else "white"))
-        self.status_var.set(f"已填入「{kind}」模板，把 XX/______ 替换成你的内容即可。")
-        self.input_text.focus_set()
-
     def _open_output_dir(self) -> None:
-        folder = Path(self.outdir_var.get())
-        folder.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(folder))
+        try:
+            os.startfile(self.outdir_var.get().strip() or str(self.config.output_dir))
+        except Exception:
+            messagebox.showinfo("提示", "输出目录不存在，请先设置。")
 
-    def _open_last_doc(self) -> None:
-        if self.last_output and self.last_output.exists():
-            os.startfile(str(self.last_output))
-        else:
-            messagebox.showinfo("提示", "还没有生成/修改过文档。")
+    @staticmethod
+    def _open_path(path: Path) -> None:
+        try:
+            os.startfile(str(path))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _open_folder_of(path: Path) -> None:
+        try:
+            os.startfile(str(path.parent))
+        except Exception:
+            pass
 
     def _show_recent(self) -> None:
-        """最近文档：列出记忆中的生成/编辑结果，一键打开或打开所在文件夹。"""
         items = [
             e for e in self.memory.entries
             if e.get("role") == "assistant" and e.get("file") and Path(str(e["file"])).exists()
@@ -583,11 +908,12 @@ class WordAgentApp:
         win.title("最近文档")
         win.geometry("760x520")
         win.transient(self.root)
-        ctk.CTkLabel(win, text="🕘 最近文档（点击文件名打开，右侧按钮打开所在文件夹）",
+        ctk.CTkLabel(win, text="🕘 最近文档（点击打开，右侧按钮打开所在文件夹）",
                      font=ctk.CTkFont("Microsoft YaHei UI", 15, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
         if not items:
             ctk.CTkLabel(win, text="（还没有生成或编辑过文档）",
-                         font=ctk.CTkFont("Microsoft YaHei UI", 12), text_color=MUTED_TEXT).pack(anchor="w", padx=18, pady=20)
+                         font=ctk.CTkFont("Microsoft YaHei UI", 12),
+                         text_color=MUTED_TEXT).pack(anchor="w", padx=18, pady=20)
             return
         box = ctk.CTkScrollableFrame(win, corner_radius=12)
         box.pack(fill="both", expand=True, padx=18, pady=(0, 16))
@@ -604,42 +930,12 @@ class WordAgentApp:
                           fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
                           command=lambda fp=f: self._open_folder_of(fp)).pack(side="right", padx=(4, 6), pady=4)
 
-    @staticmethod
-    def _open_path(path: Path) -> None:
-        try:
-            os.startfile(str(path))
-        except Exception:
-            pass
-
-    @staticmethod
-    def _open_folder_of(path: Path) -> None:
-        try:
-            os.startfile(str(path.parent))
-        except Exception:
-            pass
-
-    def _export_log(self) -> None:
-        """把当前运行日志导出为 .txt 文件。"""
-        from datetime import datetime as _dt
-        default = f"WordAgent日志_{_dt.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        target = filedialog.asksaveasfilename(
-            title="导出运行日志", defaultextension=".txt", initialfile=default,
-            filetypes=[("文本文件", "*.txt")],
-        )
-        if not target:
-            return
-        try:
-            Path(target).write_text(self.log_text.get("1.0", "end").strip() + "\n", encoding="utf-8-sig")
-            self._log(f"📤 日志已导出：{target}")
-        except OSError as exc:
-            messagebox.showerror("导出失败", f"无法写入日志文件：{exc}")
-
     def _show_memory(self) -> None:
         win = ctk.CTkToplevel(self.root)
         win.title("上下文记忆")
         win.geometry("720x460")
         win.transient(self.root)
-        ctk.CTkLabel(win, text="🧠 上下文记忆（历史指令与结果）",
+        ctk.CTkLabel(win, text="🧠 上下文记忆（历史指令与结果，AI 会结合这些上下文）",
                      font=ctk.CTkFont("Microsoft YaHei UI", 15, "bold")).pack(anchor="w", padx=18, pady=(16, 6))
         box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
         box.pack(fill="both", expand=True, padx=18, pady=12)
@@ -649,380 +945,54 @@ class WordAgentApp:
     def _clear_memory(self) -> None:
         if messagebox.askyesno("确认", "确定清空全部上下文记忆吗？"):
             self.memory.clear()
-            self._log("已清空上下文记忆。")
+            self._add_system_bubble("🧠 已清空上下文记忆。")
 
-    # ================= 主入口 =================
-    def _run(self) -> None:
-        if self.busy:
+    def _clear_chat(self) -> None:
+        if messagebox.askyesno("确认", "清空当前聊天记录？（不影响上下文记忆）"):
+            for child in self.chat_scroll.winfo_children():
+                child.destroy()
+            self._bubbles.clear()
+            self.chat_history.clear()
+            self._scroll_hint = ctk.CTkLabel(self.chat_scroll,
+                                             text="💡 按 Enter 发送 · Shift+Enter 换行 · 可附 .docx / 图片 / PDF 参考文件",
+                                             font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT)
+            self._scroll_hint.pack(side="bottom", fill="x", pady=(6, 8))
+            self._greet()
+            self._set_status("已清空对话")
+
+    def _export_chat(self) -> None:
+        from datetime import datetime as _dt
+        default = f"WordAgent对话_{_dt.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        target = filedialog.asksaveasfilename(title="导出对话记录", defaultextension=".txt",
+                                              initialfile=default, filetypes=[("文本文件", "*.txt")])
+        if not target:
             return
-        command = self.input_text.get("1.0", "end").strip()
-        if not command or self._is_placeholder():
-            messagebox.showwarning("提示", "请先输入指令。")
-            return
-        key = self.key_var.get().strip() or self.config.api_key
-        if not key:
-            messagebox.showwarning(
-                "缺少 API Key",
-                "请填写 DeepSeek API Key。\n\n也可以在工作目录创建 .env 文件：\nDEEPSEEK_API_KEY=sk-xxx\nDEEPSEEK_MODEL=deepseek-v4-flash",
-            )
-            return
-        self.config.api_key = key
-        self.config.model = self.model_var.get().strip() or self.config.model
-
-        if self.mode_var == "edit":
-            src = Path(self.file_var.get().strip())
-            if not src.exists():
-                messagebox.showwarning("提示", "请选择要编辑的 .docx 文件。")
-                return
-            self._set_busy(True, "正在读取文档并生成修改计划……")
-            threading.Thread(target=self._worker_edit_prepare, args=(src, command, list(self.ref_files)), daemon=True).start()
-        else:
-            style_override = None
-            style_raw = self.style_var.get()
-            if not style_raw.startswith("auto"):
-                style_override = style_raw.split("（")[0]
-            standard_override = None
-            std_raw = self.std_var.get()
-            if not std_raw.startswith("auto"):
-                standard_override = std_raw.split("（")[0]
-            fill_tpl = self.fill_tpl_var.get()
-            output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
-            self._set_busy(True, "正在解析需求……")
-            threading.Thread(target=self._worker_generate,
-                             args=(command, style_override, standard_override, output_dir,
-                                   list(self.ref_files), fill_tpl),
-                             daemon=True).start()
-
-    def _set_busy(self, busy: bool, status: str = "") -> None:
-        self.busy = busy
-        self.run_btn.configure(state="disabled" if busy else "normal")
-        for btn in (self.mode_gen_btn, self.mode_edit_btn):
-            btn.configure(state="disabled" if busy else "normal")
-        if status:
-            self.status_var.set(status)
-
-    # ================= Worker（后台线程） =================
-    def _worker_generate(self, command: str, style_override: str | None,
-                         standard_override: str | None, output_dir: Path,
-                         ref_files: list[str] | None = None, fill_tpl: bool = False) -> None:
-        def log(msg: str) -> None:
-            self.events.put(("log", msg))
+        lines = [f"WordAgent 对话记录　{_dt.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        for m in self.chat_history:
+            role = "我" if m["role"] == "user" else "WordAgent"
+            lines.append(f"【{role}】{m['text']}")
+            for f in m.get("files", []):
+                lines.append(f"　📎 {f}")
+            lines.append("")
         try:
-            if fill_tpl:
-                tpl = next((Path(f) for f in (ref_files or []) if str(f).lower().endswith(".docx")), None)
-                if tpl is None:
-                    self.events.put(("error", "「在模板中填写」需要先添加一个 .docx 模板文件作为参考文件。"))
-                    return
-                llm = LLMClient(self.config)
-                self.config.output_dir_override = output_dir
-                path = fill_template(tpl, command, self.config, self.memory, llm=llm, log=log)
-                self.config.output_dir_override = None
-                self.events.put(("done_generate", str(path)))
-                return
-            llm = LLMClient(self.config)
-            path = run_pipeline(command, self.config, self.memory, log=log,
-                                style_override=style_override, output_dir_override=output_dir,
-                                reference_files=ref_files, llm=llm,
-                                confirm_plan=self._request_plan_confirm,
-                                standard_override=standard_override)
-            if path is None:
-                self.events.put(("cancelled",))
-                return
-            if hasattr(llm, "usage_text"):
-                log(f"⚙ {llm.usage_text()}")
-            self.events.put(("done_generate", str(path)))
-        except (LLMError, Exception) as exc:  # noqa: BLE001
-            self.events.put(("error", str(exc)))
+            Path(target).write_text("\n".join(lines), encoding="utf-8-sig")
+            self._add_system_bubble(f"📤 对话已导出：{target}")
+        except OSError as exc:
+            messagebox.showerror("导出失败", f"无法写入文件：{exc}")
 
-    def _worker_edit_prepare(self, src: Path, instruction: str, ref_files: list[str] | None = None) -> None:
-        def log(msg: str) -> None:
-            self.events.put(("log", msg))
-        try:
-            llm = LLMClient(self.config)
-            state = prepare_edit(src, instruction, self.config, self.memory, llm=llm, log=log,
-                                 reference_files=ref_files)
-            if hasattr(llm, "usage_text"):
-                log(f"⚙ {llm.usage_text()}")
-            self.events.put(("preview", state))
-        except (LLMError, Exception) as exc:  # noqa: BLE001
-            self.events.put(("error", str(exc)))
-
-    def _worker_edit_finalize(self, state: dict) -> None:
-        def log(msg: str) -> None:
-            self.events.put(("log", msg))
-
-        def resolve_ambiguous(op: dict, candidates: list[str]) -> str | None:
-            """目标有歧义时弹窗让用户选择（主线程展示，阻塞等待）。"""
-            result: list[str | None] = [None]
-            evt = threading.Event()
-
-            def _show() -> None:
-                win = ctk.CTkToplevel(self.root)
-                win.title("目标匹配到多个位置")
-                win.geometry("640x460")
-                win.transient(self.root)
-                win.grab_set()
-                ctk.CTkLabel(win, text=f"指令「{str(op.get('target', ''))[:40]}」匹配到多个段落，请选择：",
-                             font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
-                box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
-                box.pack(fill="both", expand=True, padx=18, pady=10)
-                for i, cand in enumerate(candidates[:6], 1):
-                    box.insert("end", f"{i}. {cand}\n")
-                box.configure(state="disabled")
-                entry = ctk.CTkEntry(win, placeholder_text="输入序号后点确认（回车=取消）", height=34)
-                entry.pack(fill="x", padx=18)
-                entry.bind("<Return>", lambda e: _confirm())
-                row = ctk.CTkFrame(win, fg_color="transparent")
-                row.pack(fill="x", padx=18, pady=(10, 16))
-
-                def _confirm() -> None:
-                    ans = entry.get().strip()
-                    if ans.isdigit() and 1 <= int(ans) <= len(candidates[:6]):
-                        result[0] = candidates[:6][int(ans) - 1]
-                    evt.set()
-                    win.destroy()
-
-                def _cancel() -> None:
-                    result[0] = None
-                    evt.set()
-                    win.destroy()
-
-                ctk.CTkButton(row, text="✓ 确认", width=110, height=36, corner_radius=12,
-                              fg_color="#2E9E5B", hover_color="#238049",
-                              font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_confirm).pack(side="left")
-                ctk.CTkButton(row, text="✕ 取消", width=100, height=36, corner_radius=12,
-                              fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
-                              font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_cancel).pack(side="left", padx=10)
-
-            self.root.after(0, _show)
-            evt.wait()
-            return result[0]
-
-        def on_warnings(issues: list[str]) -> bool:
-            """结构校验有风险时弹窗询问是否继续（阻塞等待用户选择）。"""
-            result: list[bool] = [False]
-            evt = threading.Event()
-
-            def _show() -> None:
-                win = ctk.CTkToplevel(self.root)
-                win.title("结构校验风险")
-                win.geometry("620x400")
-                win.transient(self.root)
-                win.grab_set()
-                ctk.CTkLabel(win, text="⚠ 结构校验发现以下风险：",
-                             font=ctk.CTkFont("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
-                box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
-                box.pack(fill="both", expand=True, padx=18, pady=10)
-                for issue in issues:
-                    box.insert("end", f"· {issue}\n")
-                box.insert("end", "\n仍要继续保存吗？原文件不会受影响（会自动备份）。")
-                box.configure(state="disabled")
-                row = ctk.CTkFrame(win, fg_color="transparent")
-                row.pack(fill="x", padx=18, pady=(10, 16))
-
-                def _yes() -> None:
-                    result[0] = True
-                    evt.set()
-                    win.destroy()
-
-                def _no() -> None:
-                    result[0] = False
-                    evt.set()
-                    win.destroy()
-
-                ctk.CTkButton(row, text="✓ 继续保存", width=120, height=36, corner_radius=12,
-                              fg_color="#2E9E5B", hover_color="#238049",
-                              font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_yes).pack(side="left")
-                ctk.CTkButton(row, text="✕ 取消", width=100, height=36, corner_radius=12,
-                              fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
-                              font=ctk.CTkFont("Microsoft YaHei UI", 13), command=_no).pack(side="left", padx=10)
-
-            self.root.after(0, _show)
-            evt.wait()
-            return result[0]
-
-        try:
-            output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
-            path = finalize_edit(state, self.config, self.memory, output_dir=output_dir,
-                                 save_as_new=not self.overwrite_var.get(), log=log,
-                                 resolve_ambiguous=resolve_ambiguous, on_warnings=on_warnings)
-            llm = state.get("llm")
-            if hasattr(llm, "usage_text"):
-                log(f"⚙ {llm.usage_text()}")
-            self.events.put(("done_edit", str(path)))
-        except (LLMError, Exception) as exc:  # noqa: BLE001
-            self.events.put(("error", str(exc)))
-
-    # ================= 事件轮询 =================
-    def _poll_events(self) -> None:
-        try:
-            while True:
-                kind, payload = self.events.get_nowait()
-                if kind == "log":
-                    self._log(payload)
-                elif kind == "plan_confirm":
-                    self._show_plan_confirm(payload)
-                elif kind == "cancelled":
-                    self._set_busy(False)
-                    self.status_var.set("已取消生成。")
-                    self._log("已取消：大纲未确认，未生成文档。")
-                elif kind == "done_generate":
-                    self._finish_ok(payload, "生成")
-                elif kind == "done_edit":
-                    self._finish_ok(payload, "编辑")
-                elif kind == "preview":
-                    self._show_preview(payload)
-                elif kind == "error":
-                    self._finish_error(payload)
-        except queue.Empty:
-            pass
-        self.root.after(120, self._poll_events)
-
-    def _request_plan_confirm(self, plan: dict) -> bool:
-        """后台线程调用：把大纲发给主线程弹窗确认，阻塞等待结果。"""
-        self._plan_evt = threading.Event()
-        self._plan_ok = False
-        self.events.put(("plan_confirm", plan))
-        self._plan_evt.wait()
-        return self._plan_ok
-
-    def _show_plan_confirm(self, plan: dict) -> None:
-        """大纲预览：满意才生成正文，避免不满意时整篇重来烧 token。"""
-        win = ctk.CTkToplevel(self.root)
-        win.title("大纲预览 — 确认后再生成正文")
-        win.geometry("720x600")
-        win.transient(self.root)
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="📋 文档大纲预览", font=ctk.CTkFont("Microsoft YaHei UI", 16, "bold")).pack(anchor="w", padx=18, pady=(16, 6))
-        style_label = {
-            "business": "商务", "report": "报告", "academic": "学术",
-            "creative": "创意文案", "default": "通用"}.get(plan.get("style"), "通用")
-        ctk.CTkLabel(win, text=f"标题：{plan.get('title', '')}　|　风格：{style_label}　|　目录：{'是' if plan.get('toc') else '否'}",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 12), text_color=MUTED_TEXT).pack(anchor="w", padx=18)
-
-        box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
-        box.pack(fill="both", expand=True, padx=18, pady=12)
-        text = ""
-        for sec in plan.get("sections", []):
-            indent = "　　" * (max(1, int(sec.get("level", 1))) - 1)
-            text += f"{indent}· {sec.get('heading', '')}\n"
-        if not text:
-            text = "（大纲为空）"
-        box.insert("1.0", text)
-        box.configure(state="disabled")
-
-        ctk.CTkLabel(win, text="不满意？直接点取消，回到输入框补充章节/风格要求后重试，不消耗正文 token。",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 11), text_color=MUTED_TEXT).pack(anchor="w", padx=18)
-
-        def on_ok() -> None:
-            self._plan_ok = True
-            self._plan_evt.set()
-            win.destroy()
-
-        def on_cancel() -> None:
-            self._plan_ok = False
-            self._plan_evt.set()
-            win.destroy()
-
-        row = ctk.CTkFrame(win, fg_color="transparent")
-        row.pack(fill="x", padx=18, pady=(0, 16))
-        ctk.CTkButton(row, text="✓ 按此大纲生成", width=150, height=38, corner_radius=12,
-                      fg_color="#2E9E5B", hover_color="#238049",
-                      font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold"), command=on_ok).pack(side="left")
-        ctk.CTkButton(row, text="✕ 取消修改指令", width=130, height=38, corner_radius=12,
-                      fg_color="transparent", border_width=1,
-                      font=ctk.CTkFont("Microsoft YaHei UI", 13), command=on_cancel).pack(side="left", padx=10)
-
-    def _show_preview(self, state: dict) -> None:
-        plan = state["plan"]
-        win = ctk.CTkToplevel(self.root)
-        win.title("修改计划预览 — 确认后才会写入")
-        win.geometry("760x560")
-        win.transient(self.root)
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="🔎 修改计划预览", font=ctk.CTkFont("Microsoft YaHei UI", 16, "bold")).pack(anchor="w", padx=18, pady=(16, 4))
-        ctk.CTkLabel(win, text=f"说明：{plan.get('summary', '')} · 共 {len(plan['operations'])} 项操作",
-                     font=ctk.CTkFont("Microsoft YaHei UI", 12), text_color=MUTED_TEXT).pack(anchor="w", padx=18)
-
-        text = ""
-        for i, op in enumerate(plan["operations"], 1):
-            text += f"{i}. [{op['op']}] 目标「{op['target']}」\n"
-            if op.get("new_text"):
-                text += f"   → 新内容：{op['new_text']}\n"
-            if op.get("style"):
-                text += f"   → 样式：{op['style']}\n"
-            text += "\n"
-        text += "⚠ 原文件将自动备份到 output/backups/，默认另存为新文件，原文件不受影响。"
-
-        box = ctk.CTkTextbox(win, corner_radius=12, font=ctk.CTkFont("Microsoft YaHei UI", 12))
-        box.pack(fill="both", expand=True, padx=18, pady=12)
-        box.insert("1.0", text)
-        box.configure(state="disabled")
-
-        btn_row = ctk.CTkFrame(win, fg_color="transparent")
-        btn_row.pack(fill="x", padx=18, pady=(0, 16))
-
-        def on_confirm() -> None:
-            win.destroy()
-            self._set_busy(True, "正在应用修改（备份 → 落笔 → 校验）……")
-            self.progress.set(0.4)
-            threading.Thread(target=self._worker_edit_finalize, args=(state,), daemon=True).start()
-
-        def on_cancel() -> None:
-            win.destroy()
-            self._set_busy(False)
-            self.status_var.set("已取消，未做任何修改。")
-            self._log("已取消编辑，未做任何修改。")
-
-        ctk.CTkButton(btn_row, text="✓ 确认修改", width=140, height=38, corner_radius=12,
-                      fg_color="#2E9E5B", hover_color="#238049",
-                      font=ctk.CTkFont("Microsoft YaHei UI", 13, "bold"), command=on_confirm).pack(side="left")
-        ctk.CTkButton(btn_row, text="✕ 取消", width=110, height=38, corner_radius=12,
-                      fg_color="transparent", border_width=1,
-                      font=ctk.CTkFont("Microsoft YaHei UI", 13), command=on_cancel).pack(side="left", padx=10)
-
-    # ================= 收尾 =================
-    def _finish_ok(self, path: str, action: str) -> None:
-        self._set_busy(False)
-        self.progress.set(1.0)
-        self.status_var.set(f"✔ {action}完成")
-        self.last_output = Path(path)
-        if messagebox.askyesno(f"{action}完成", f"文档已保存到：\n{path}\n\n是否立即打开？"):
-            os.startfile(str(self.last_output))
-
-    def _finish_error(self, message: str) -> None:
-        self._set_busy(False)
-        self.status_var.set("✖ 操作失败")
-        self._log(f"✖ 错误：{message}")
-        messagebox.showerror("操作失败", message)
-
-    def _log(self, message: str) -> None:
-        self.log_text.configure(state="normal")
-        self.log_text.insert("end", message + "\n")
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
-        self._bump_progress(message)
-
-    def _bump_progress(self, message: str) -> None:
-        """根据日志关键字平滑推进进度条（生成/编辑通用）。"""
-        pairs = [
-            ("① 解析需求", 0.08), ("② 逐节生成", 0.12), ("③ 排版", 0.85),
-            ("✔ 生成完成", 1.0),
-            ("① 读取文档", 0.05), ("② 解析编辑指令", 0.12), ("③ 校验并应用", 0.4),
-            ("④ AI 复核", 0.7), ("✔ 编辑完成", 1.0),
-        ]
-        if self.busy:
-            import re
-            m = re.search(r"\[(\d+)/(\d+)\] 撰写", message)
-            if m:
-                self.progress.set(0.12 + 0.68 * int(m.group(1)) / max(1, int(m.group(2))))
-                return
-            for keyword, value in pairs:
-                if keyword in message:
-                    self.progress.set(value)
-                    return
+    # ================= 欢迎语 =================
+    def _greet(self) -> None:
+        self._add_assist_bubble(
+            "👋 你好，我是 WordAgent！\n\n"
+            "直接告诉我要什么文档即可，例如：\n"
+            "· 写一份《数据库课程实验报告》\n"
+            "· 写一份本周工作周报\n"
+            "· 生成《2026 市场推广方案》\n\n"
+            "要编辑或套模板时，先点「📎 附件」添加 .docx，然后说：\n"
+            "· 把标题改成《XXX》，第二节改得更正式\n"
+            "· 按模板填写这份实验报告\n\n"
+            "我会自动判断需求类型，支持连续对话与上下文记忆。"
+        )
 
 
 def main() -> int:
@@ -1049,5 +1019,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

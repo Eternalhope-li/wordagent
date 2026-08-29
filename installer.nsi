@@ -1,7 +1,7 @@
 ﻿; WordAgent AI 文档助手 — NSIS 安装脚本
 Unicode true
  !define APP_NAME "WordAgent"
-!define APP_VERSION "1.7.5"
+!define APP_VERSION "1.8.0"
 !define APP_PUBLISHER "eternalhope"
 !define APP_EXE "WordAgent.exe"
 
@@ -14,12 +14,12 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
-VIProductVersion "1.7.5.0"
+VIProductVersion "1.8.0.0"
  VIAddVersionKey "ProductName" "WordAgent AI 文档助手"
  VIAddVersionKey "CompanyName" "eternalhope"
  VIAddVersionKey "FileDescription" "WordAgent AI 文档助手 安装程序"
-VIAddVersionKey "FileVersion" "1.7.5"
-VIAddVersionKey "ProductVersion" "1.7.5"
+VIAddVersionKey "FileVersion" "1.8.0"
+VIAddVersionKey "ProductVersion" "1.8.0"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2026 eternalhope"
 
 !define MUI_ICON "assets\icon.ico"
