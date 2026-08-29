@@ -1,0 +1,24 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# ===== 构建产物（绿色版 / 安装包）=====
+build/
+dist/
+installer/
+*.spec.bak
+
+# ===== 用户数据（含隐私，勿提交）=====
+.env
+memory.json
+output/
+*.log
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

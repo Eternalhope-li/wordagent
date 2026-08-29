@@ -1,0 +1,21 @@
+{
+  "name": "某高校实验报告（示例）",
+  "body_font": "宋体",
+  "body_font_latin": "Times New Roman",
+  "body_size": 12.0,
+  "line_spacing": 1.5,
+  "line_spacing_rule": "multiple",
+  "first_line_indent_chars": 2,
+  "justify": true,
+  "heading_fonts": {"1": "黑体", "2": "黑体", "3": "黑体", "4": "黑体"},
+  "heading_sizes": {"1": 16, "2": 14, "3": 12.5, "4": 12},
+  "heading_bold": {"1": false, "2": false, "3": false, "4": false},
+  "heading_color": "000000",
+  "title_font": "黑体",
+  "title_size": 22,
+  "title_bold": true,
+  "title_page": true,
+  "toc": false,
+  "code_font": "Consolas",
+  "page": {"top_cm": 2.5, "bottom_cm": 2.5, "left_cm": 2.8, "right_cm": 2.8}
+}
