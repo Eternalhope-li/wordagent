@@ -31,7 +31,7 @@ VERSION_LABEL = f"v{__version__}"
 PLACEHOLDER = (
     "输入你的文档要求，例如：\n"
     "· 写一份实验报告 / 周报 / 方案 / 会议纪要……\n"
-    "· 或点「📎 附件」添加 .docx 后说：把标题改成《XXX》，第二节改得更正式"
+    "· 或先点「📄 选择要操作的文件」，再输入：把标题改成《XXX》、第二节改得更正式"
 )
 
 STD_OPTIONS = [
@@ -60,7 +60,7 @@ CHIP_PROMPTS = [
     ("📦 需求文档", "写一份软件需求文档（PRD），包含：项目背景、目标用户、功能需求、非功能需求、交互流程、验收标准。"),
     ("🗓 周报", "写一份本周工作周报，包含：本周完成事项、关键进展、遇到的问题与解决、下周工作计划。"),
     ("📈 数据分析", "写一份数据分析报告，包含：数据来源、分析指标、趋势分析、异常说明、结论与建议。"),
-    ("✏️ 编辑/套模板", "（先点 📎 添加 .docx 再发送）把标题改成……，第二节改得更正式……"),
+    ("✏️ 编辑/套模板", "（先点「📄 选择要操作的文件」再发送）把标题改成……，第二节改得更正式……"),
 ]
 
 # ---- 主题配色（亮色, 深色） ----
@@ -99,6 +99,19 @@ def _base_stem(name: str) -> str:
             return name[: -len(suf)]
     return name
 
+# 生成类指令词：即使设置了工作文件，也优先按“生成新文档”处理
+GEN_WORDS = ("写一份", "写一篇", "写个", "写一", "生成", "新建", "创建", "起草", "做一份", "来一份")
+GREETING_WORDS = ("你好", "您好", "hello", "hi", "在吗", "谢谢", "辛苦了", "早上好", "晚上好", "再见")
+
+
+def _is_generation_request(text: str) -> bool:
+    return any(w in text for w in GEN_WORDS)
+
+
+def _looks_like_greeting(text: str) -> bool:
+    t = text.strip().lower()
+    return not t or any(w in t for w in GREETING_WORDS)
+
 
 class WordAgentApp:
     def __init__(self, root: ctk.CTk):
@@ -109,6 +122,7 @@ class WordAgentApp:
         self.busy = False
         self.last_output: Path | None = None
         self.attachments: list[str] = []
+        self.work_file: str | None = None  # 当前操作文件（编辑/填写目标，常驻）
 
         # 聊天状态
         self.chat_history: list[dict] = []
@@ -277,18 +291,23 @@ class WordAgentApp:
         self.chat_scroll.grid(row=2, column=0, sticky="nsew", padx=14, pady=(2, 4))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
         # 底部常驻提示：让聊天区底部始终有信息感，不出现“空灰块”
-        self._scroll_hint = ctk.CTkLabel(self.chat_scroll, text="💡 按 Enter 发送 · Shift+Enter 换行 · 可按需附 .docx / 图片 / PDF 等参考文件",
+        self._scroll_hint = ctk.CTkLabel(self.chat_scroll, text="💡 按 Enter 发送 · Shift+Enter 换行 · 📄 选择操作文件可连续修改 · 📎 附件添加参考文件",
                                          font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT)
         self._scroll_hint.pack(side="bottom", fill="x", pady=(6, 8))
 
-        # 附件栏
+        # 当前操作文件栏（常驻：编辑/填写始终作用于该文件）
+        self.work_frame = ctk.CTkFrame(col, fg_color="transparent")
+        self.work_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 0))
+        self._refresh_work_row()
+
+        # 参考文件栏
         self.attach_frame = ctk.CTkFrame(col, fg_color="transparent")
-        self.attach_frame.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 0))
+        self.attach_frame.grid(row=4, column=0, sticky="ew", padx=14, pady=(2, 0))
 
         # 输入区（现代聊条样式：高对比圆角容器 + 内部输入框）
         inp = ctk.CTkFrame(col, fg_color=INPUT_BG, corner_radius=18, border_width=1,
                            border_color=("#C9D6EE", "#51628A"))
-        inp.grid(row=4, column=0, sticky="ew", padx=14, pady=(8, 12))
+        inp.grid(row=5, column=0, sticky="ew", padx=14, pady=(8, 12))
         inp.grid_columnconfigure(0, weight=1)
         self.input_text = ctk.CTkTextbox(inp, height=76, corner_radius=12, border_width=0,
                                          fg_color="transparent", wrap="word",
@@ -354,6 +373,64 @@ class WordAgentApp:
         self.input_text.configure(text_color=("gray10" if ctk.get_appearance_mode().lower() == "light" else "white"))
         self.input_text.focus_set()
 
+    # ---------- 当前操作文件 ----------
+    def _pick_work_file(self) -> None:
+        """选择要操作的 .docx：编辑/填写始终作用于该文件，直到手动清除/更换。"""
+        if self.busy:
+            return
+        chosen = filedialog.askopenfilename(
+            title="选择要操作的 Word 文档（之后可一直修改这个文件）",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")],
+        )
+        if chosen:
+            self._set_work_file(chosen)
+
+    def _set_work_file(self, path: str) -> None:
+        self.work_file = str(path)
+        self._refresh_work_row()
+        self._set_status(f"当前操作文件：{Path(path).name}")
+
+    def _clear_work_file(self, pick_next: bool = False) -> None:
+        """清除当前操作文件；pick_next=True 时清除后立即重新选择（✕ = 删掉再添加）。"""
+        self.work_file = None
+        self._refresh_work_row()
+        self._set_status("已清除当前操作文件")
+        if pick_next:
+            self._pick_work_file()
+
+    def _refresh_work_row(self) -> None:
+        for child in self.work_frame.winfo_children():
+            child.destroy()
+        if self.work_file:
+            wf = Path(self.work_file)
+            ctk.CTkLabel(self.work_frame, text="📄 当前操作文件：",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 11), text_color=MUTED_TEXT).pack(side="left", padx=(0, 4))
+            chip = ctk.CTkFrame(self.work_frame, corner_radius=9,
+                                fg_color=("#DCE8FD", "#1E3A5F"))
+            chip.pack(side="left", padx=2, pady=3)
+            ctk.CTkLabel(chip, text=f" {wf.name}",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 11, "bold"),
+                         text_color=("#1B3F9E", "#8CB8FF")).pack(side="left", padx=(10, 4), pady=4)
+            ctk.CTkButton(chip, text="✕", width=24, height=22, corner_radius=6,
+                          fg_color="transparent", hover_color=ERROR_TEXT, text_color=MUTED_TEXT,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                          command=lambda: self._clear_work_file(pick_next=True)).pack(side="left", padx=(2, 6))
+            ctk.CTkButton(self.work_frame, text="📄 更换", width=64, height=26, corner_radius=10,
+                          fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
+                          text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 10),
+                          command=self._pick_work_file).pack(side="left", padx=4)
+            ctk.CTkLabel(self.work_frame, text="编辑/填写将始终作用于该文件",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT).pack(side="left", padx=6)
+        else:
+            ctk.CTkButton(self.work_frame, text="📄 选择要操作的文件", width=150, height=30, corner_radius=10,
+                          fg_color="transparent", border_width=1, border_color=SIDEBAR_BTN_BORDER,
+                          text_color=SIDEBAR_BTN_TEXT, hover_color=SIDEBAR_BTN_HOVER,
+                          font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                          command=self._pick_work_file).pack(side="left")
+            ctk.CTkLabel(self.work_frame, text="选中后可一直修改这个文件；📎 附件用于添加参考文件（图片 / 数据 / PDF / 其他 .docx）",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT).pack(side="left", padx=8)
+
     def _pick_files(self) -> None:
         if self.busy:
             return
@@ -368,8 +445,10 @@ class WordAgentApp:
             ],
         )
         for f in chosen:
-            if f not in self.attachments:
-                self.attachments.append(f)
+            if str(f).lower().endswith(".docx") and not self.work_file:
+                self._set_work_file(f)  # 首个 .docx 自动设为操作文件
+            elif f not in self.attachments:
+                self.attachments.append(f)  # 其余全部作为参考文件
         self._refresh_attach_row()
 
     def _refresh_attach_row(self) -> None:
@@ -377,7 +456,7 @@ class WordAgentApp:
             child.destroy()
         if not self.attachments:
             return
-        ctk.CTkLabel(self.attach_frame, text="📎 已选择：",
+        ctk.CTkLabel(self.attach_frame, text="📎 参考文件：",
                      font=ctk.CTkFont("Microsoft YaHei UI", 11), text_color=MUTED_TEXT).pack(side="left", padx=(0, 6))
         for f in self.attachments:
             chip = ctk.CTkFrame(self.attach_frame, corner_radius=8, fg_color=ASSIST_BUBBLE)
@@ -406,19 +485,34 @@ class WordAgentApp:
 
     # ================= 意图识别与发送 =================
     def _detect_intent(self, text: str, files: list[str]):
-        """自动判断需求类型：fill（按模板填写）/ edit（编辑已有文档）/ generate（生成新文档）。"""
-        docx = next((f for f in files if str(f).lower().endswith(".docx")), None)
-        others = [f for f in files if f != docx]
-        if docx:
-            if any(k in text for k in FILL_KEYWORDS):
-                return "fill", docx, others, "📋 检测到模板文件，将按模板结构填写内容。"
-            if any(k in text for k in STRONG_EDIT) or any(k in text for k in WEAK_EDIT):
-                return "edit", docx, others, "📄 检测到 .docx 与修改要求，将先读取文档内容再精准修改。"
-            return "generate", None, [docx] + others, "📄 已把 .docx 作为模板参考（如需修改/填写，请加上“修改/填写”等词）。"
-        if any(k in text for k in STRONG_EDIT):
-            if self.last_output and Path(self.last_output).exists():
-                return "edit", str(self.last_output), files, f"📄 将基于当前文档继续修改：{Path(self.last_output).name}"
-            return "need_doc", None, files, "看起来你想编辑文档：请先点「📎 附件」添加要编辑的 .docx，再发送这条要求。"
+        """自动判断需求类型：fill（按模板填写）/ edit（编辑已有文档）/ generate（生成新文档）。
+
+        优先级：明确的填写/编辑意图 > 工作文件持续编辑 > 生成新文档。
+        工作文件（当前操作文件）与参考文件分离：工作文件是编辑/填写目标，
+        📎 附件里的文件一律作为参考内容注入（可能和工作文件不是同一个）。
+        """
+        docx_refs = [f for f in files if str(f).lower().endswith(".docx")]
+        work = self.work_file if (self.work_file and Path(self.work_file).exists()) else None
+
+        # 1) 明确的填写意图：目标 = 工作文件 > 附件中的 .docx
+        if any(k in text for k in FILL_KEYWORDS):
+            target = work or (docx_refs[0] if docx_refs else None)
+            if target:
+                refs = files if work else [f for f in files if f != target]
+                return "fill", target, refs, f"📋 将按「{Path(target).name}」的结构填写内容。"
+            return "need_doc", None, files, "看起来你想按模板填写：请先点「📄 选择要操作的文件」选择要填写的 .docx。"
+        # 2) 明确的编辑意图
+        if any(k in text for k in STRONG_EDIT) or any(k in text for k in WEAK_EDIT):
+            target = work or (docx_refs[0] if docx_refs else None)
+            if target:
+                refs = files if work else [f for f in files if f != target]
+                return "edit", target, refs, f"📄 将修改「{Path(target).name}」（先读取文档内容再精准编辑）。"
+            if any(k in text for k in STRONG_EDIT):
+                return "need_doc", None, files, "看起来你想编辑文档：请先点「📄 选择要操作的文件」选择 .docx，再发送这条要求。"
+            return "generate", None, files, ""
+        # 3) 没有编辑词：已设置工作文件时，短指令默认继续修改它
+        if work and not _is_generation_request(text) and not _looks_like_greeting(text):
+            return "edit", work, files, f"📄 将基于当前操作文件继续修改：{Path(work).name}"
         return "generate", None, files, ""
 
     def _send_message(self) -> None:
@@ -527,6 +621,7 @@ class WordAgentApp:
                 usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
                 base = _base_stem(Path(target).stem)
                 orig = output_dir / "versions" / f"{base}_原始版.docx"
+                self.events.put(("work_update", str(path)))
                 self.events.put(("done_edit", str(path), mid, usage, str(orig)))
             elif kind == "fill":
                 path = fill_template(Path(target), text, self.config, self.memory, llm=llm, log=log)
@@ -769,6 +864,8 @@ class WordAgentApp:
                 elif kind == "done_edit":
                     self._finish_ok(item[1], item[2], "修改", item[3] if len(item) > 3 else "",
                                     item[4] if len(item) > 4 else "")
+                elif kind == "work_update":
+                    self._set_work_file(item[1])
                 elif kind == "error":
                     self._finish_error(item[1], item[2])
         except queue.Empty:
@@ -1089,9 +1186,10 @@ class WordAgentApp:
             "· 写一份实验报告\n"
             "· 写一份本周工作周报\n"
             "· 生成一份推广方案\n\n"
-            "要编辑或套模板时，先点「📎 附件」添加 .docx，然后说：\n"
+            "要编辑或套模板时，先点「📄 选择要操作的文件」，然后说：\n"
             "· 把标题改成《XXX》，第二节改得更正式\n"
-            "· 按模板填写这份报告\n\n"
+            "· 按模板填写这份报告\n"
+            "选中后可一直修改这个文件；「📎 附件」用于添加参考文件（图片 / 数据 / PDF）。\n\n"
             "我会自动判断需求类型，支持连续对话与上下文记忆。"
         )
 
