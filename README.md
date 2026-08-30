@@ -8,7 +8,7 @@
 ![python-docx](https://img.shields.io/badge/docx-python--docx-217346)
 ![UI](https://img.shields.io/badge/UI-customtkinter-1A73E8)
 ![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.7.5-blue)
+![Version](https://img.shields.io/badge/version-1.8.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 
@@ -51,6 +51,7 @@ WordAgent 是一个 **PC 端 AI 文档 Agent**，把「写 Word / 改 Word」变
 - 📑 **模板填写模式**：直接在给定模板中填写——保留模板的信息表、表格、页眉页脚与全部格式，AI 按标题定位填入章节、按表头追加数据行，输出填写完成度报告。
 - ✅ **程序化质量门禁**：生成/编辑完成后本地自动校验 8 项（标题层级、空段污染、Markdown 残留、字体一致性、表格边框、内容充实度、图片图注、文档完整性），可安全修复的项自动修复，**全程不消耗 token**。
 - 🔒 **重要文件安全机制**：自动备份、默认另存、先校验后落笔（任一目标不匹配整体中止不写盘）、修改计划预览确认、AI 复核、三级目标匹配 + 歧义人工选择。
+- 📑 **双版本回退**：每次编辑后自动保留「原始版 + 完成版」两份 Word，侧边栏可一键回退，历史版本自动清理只留最新两份。
 - 💾 **上下文记忆**：历史指令与结果持久化，新任务自动参考；GUI 侧边栏一键打开最近文档。
 - 🖥️ **成熟 PC 软件**：安装包 + 绿色版双形态，开始菜单/桌面快捷方式、一键卸载、深色/浅色双主题、API Key 可在界面自行设置。
 
