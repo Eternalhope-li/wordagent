@@ -1,4 +1,4 @@
-﻿"""内容生成：按大纲逐节撰写 Markdown 正文。
+"""内容生成：按大纲逐节撰写 Markdown 正文。
 
 省 token 设计（适配推理模型）：
 - 短文档（<=3 节）一次调用生成全文，避免多次“思考-输出”的固定开销
@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Optional
 
@@ -256,3 +257,120 @@ def generate_document(
         wave_start += len(wave)
 
     return "\n\n".join(part for part in parts if part)
+
+# ---------------------------------------------------------------- 内容充实度补全
+# 与 verify.py 的 MIN_SECTION_BODY 保持一致：低于此值视为「半截内容」
+MIN_SECTION_BODY_CHARS = 40
+
+
+def _split_sections(markdown: str) -> tuple[list, list]:
+    """把 markdown 拆成节列表，返回 (行列表, 节列表)。
+
+    节结构：{"level": 1, "heading": "标题", "start": 行号, "end": 行号(不含)}。
+    """
+    heading_re = re.compile(r"^(#{1,4})\s+(.*)$")
+    lines = markdown.splitlines()
+    sections: list[dict] = []
+    cur = None
+    for i, ln in enumerate(lines):
+        m = heading_re.match(ln)
+        if m:
+            if cur is not None:
+                cur["end"] = i
+                sections.append(cur)
+            cur = {"level": len(m.group(1)), "heading": m.group(2).strip(),
+                   "start": i, "end": None}
+    if cur is not None:
+        cur["end"] = len(lines)
+        sections.append(cur)
+    return lines, sections
+
+
+def expand_short_sections(
+    markdown: str,
+    plan: dict[str, Any],
+    llm: LLMClient,
+    log: Optional[Callable[[str], None]] = None,
+    reference_context: str = "",
+) -> str:
+    """把正文过短的章节做一次批量扩写（仅 1 次 LLM 调用），返回补全后的 markdown。
+
+    只扩写「已生成但正文 < MIN_SECTION_BODY_CHARS 字」的章节；没有过短章节时
+    原样返回，不消耗任何 token。失败时静默保留当前内容，不影响主流程。
+    """
+    lines, sections = _split_sections(markdown)
+    short: list[dict] = []
+    for sec in sections:
+        body = "\n".join(lines[sec["start"] + 1: sec["end"]])
+        if len(re.sub(r"\s", "", body)) < MIN_SECTION_BODY_CHARS:
+            short.append({**sec, "body": body})
+    if not short:
+        return markdown
+
+    doc_type = plan.get("doc_type", "general")
+    style = plan.get("style", "default")
+    title = plan.get("title", "")
+    brief = "\n\n".join(
+        "### 章节：" + s["heading"] + "\n当前内容：\n" + ((s["body"].strip() or "（空）")[:400])
+        for s in short
+    )
+    system = (
+        "你是一名严谨的文档写手，负责把文档中「内容过短、没写完」的章节补全完整。\n"
+        "要求：\n"
+        "- 严格只输出 JSON，格式：sections 数组，每项含 heading 与 content 两个字段。\n"
+        "- content 只写该章节正文（不含标题行），可用 `-` 无序列表、`1.` 有序列表、`| 表格 |`、`> 引用` 等结构。\n"
+        "- 正文不要使用 **加粗**、*斜体*、`反引号` 等行内标记；不要使用 LaTeX 数学符号。\n"
+        "- 每节内容要充实完整：说明/分析/总结类 120~250 字；步骤/流程类用编号列出完整流程（不少于 4 步，写明具体操作、参数与观察/结果）。\n"
+        "- 数据若无参考文件依据必须标注「示例」，严禁凭空伪造具体测量结果与结论。\n"
+        "- 保持与文档整体风格一致，不新增章节标题，不重复其他章节的内容。"
+    )
+    user = (
+        "文档标题《" + title + "》。文档类型：" + (doc_type or "general")
+        + "。\n下面这些章节正文过短，请补全（保留原意，只做扩写，不要改章节标题）：\n\n"
+        + brief
+        + (("\n\n【参考文件内容摘要】\n" + reference_context) if reference_context else "")
+    )
+    try:
+        data = llm.chat_json(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.4, max_tokens=8192,
+        )
+    except Exception as exc:  # noqa: BLE001
+        if log:
+            log("   ⚠ 过短章节补全失败（" + str(exc) + "），保留当前内容")
+        return markdown
+
+    replacements: dict[str, str] = {}
+    for item in data.get("sections") or []:
+        if not isinstance(item, dict):
+            continue
+        h = str(item.get("heading", "")).strip()
+        c = str(item.get("content", "")).strip()
+        if h and c:
+            replacements[h] = c
+    if not replacements:
+        return markdown
+
+    # 标题容错匹配：容忍「1.」「一、」等序号前缀
+    num_prefix_re = re.compile(r"^[（(]?[0-9一二三四五六七八九十]+[、．.）)]?\s*")
+
+    def _norm(t: str) -> str:
+        t2 = num_prefix_re.sub("", t.strip()).strip()
+        return t2 or t.strip()
+
+    target = {_norm(h): h for h in replacements}
+    new_lines = list(lines)
+    fixed = 0
+    # 从后往前拼接，避免替换后行号偏移
+    for sec in reversed(sections):
+        key = _norm(sec["heading"])
+        if key not in target:
+            continue
+        content = replacements[target[key]]
+        block = [ln for ln in content.splitlines() if ln.strip()]
+        new_lines[sec["start"] + 1: sec["end"]] = block
+        fixed += 1
+    if log and fixed:
+        names = ", ".join(replacements[target[k]] for k in list(target)[:3])
+        log("   ⚙ 已自动补全 " + str(fixed) + " 个过短章节（" + names + "…）")
+    return "\n".join(new_lines)

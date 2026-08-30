@@ -490,7 +490,8 @@ class WordAgentApp:
                 sr2 = self.std_var.get()
                 if not sr2.startswith("auto"):
                     standard_override = sr2.split("（")[0]
-                output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+                _outdir = self.outdir_var.get().strip()
+                output_dir = Path(_outdir) if _outdir else self.config.output_dir
                 path = run_pipeline(text, self.config, self.memory, log=log,
                                     style_override=style_override, standard_override=standard_override,
                                     output_dir_override=output_dir, reference_files=refs,
@@ -501,7 +502,8 @@ class WordAgentApp:
                 usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
                 self.events.put(("done_generate", str(path), mid, usage))
             elif kind == "edit":
-                output_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+                _outdir = self.outdir_var.get().strip()
+                output_dir = Path(_outdir) if _outdir else self.config.output_dir
                 state = prepare_edit(Path(target), text, self.config, self.memory,
                                      llm=llm, log=log, reference_files=refs)
                 self.events.put(("edit_plan", state, mid))
@@ -982,7 +984,8 @@ class WordAgentApp:
 
     def _show_versions(self) -> None:
         """版本管理：列出输出目录里全部 原始版/完成版 版本对，支持打开与回退。"""
-        out_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+        _outdir = self.outdir_var.get().strip()
+        out_dir = Path(_outdir) if _outdir else self.config.output_dir
         ver_dir = out_dir / "versions"
         pairs: dict[str, list] = {}
         if ver_dir.is_dir():

@@ -1,4 +1,4 @@
-﻿"""WordAgent 配置加载。"""
+"""WordAgent 配置加载。"""
 from __future__ import annotations
 
 import os
@@ -51,6 +51,7 @@ class Config:
     request_timeout: int = 180
     max_retries: int = 3
     concurrency: int = 3  # 分节生成时的并发请求数（不要太大，避免限流）
+    auto_expand: bool = True  # 生成时自动补全过短章节（1 次调用，可关闭省 token）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -65,4 +66,6 @@ class Config:
             request_timeout=int(os.getenv("DEEPSEEK_TIMEOUT", "180")),
             max_retries=int(os.getenv("DEEPSEEK_MAX_RETRIES", "3")),
             concurrency=max(1, int(os.getenv("DEEPSEEK_CONCURRENCY", "3"))),
+            auto_expand=os.getenv("WORDAGENT_AUTO_EXPAND", "1").strip().lower()
+            not in ("0", "false", "no", "off"),
         )

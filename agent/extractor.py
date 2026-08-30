@@ -1,4 +1,4 @@
-﻿"""docx -> 结构化 Markdown 提取（编辑模式用，保留段落/表格/样式信息）。"""
+"""docx -> 结构化 Markdown 提取（编辑模式用，保留段落/表格/样式信息）。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ from typing import Iterator, Optional
 from docx import Document
 from docx.oxml.ns import qn
 from docx.table import Table
+import re
 from docx.text.paragraph import Paragraph
 
 
@@ -37,11 +38,11 @@ def _iter_blocks(doc: Document) -> Iterator[Paragraph | Table]:
 def _heading_level(para: Paragraph) -> Optional[int]:
     style = para.style
     name = (style.name if style is not None else "") or ""
-    for part in name.split():
-        if part.isdigit():
-            return int(part)
-    if name.lower().startswith(("heading", "标题")):
-        return 1
+    low = name.lower()
+    # 只认标题类样式（Heading N / 标题 N），避免 "List Bullet 2" 等被误判为标题
+    if low.startswith(("heading", "标题")):
+        m = re.search(r"\d+", name)
+        return int(m.group()) if m else 1
     ppr = para._p.pPr
     if ppr is not None:
         outline = ppr.find(qn("w:outlineLvl"))

@@ -1,4 +1,4 @@
-﻿"""高层编排：指令 -> 大纲 -> 正文 -> docx（控制台与桌面版共用）。"""
+"""高层编排：指令 -> 大纲 -> 正文 -> docx（控制台与桌面版共用）。"""
 from __future__ import annotations
 
 import re
@@ -220,6 +220,17 @@ def run_pipeline(
 
     # 兜底：确保每个章节标题都出现在正文中（模型偶发漏写标题时自动补齐）
     markdown = ensure_section_headings(markdown, plan.get("sections") or [])
+
+    # 内容充实度补全：正文过短的章节一次批量扩写（默认开启，可用 WORDAGENT_AUTO_EXPAND=0 关闭）
+    if getattr(config, "auto_expand", True):
+        try:
+            from .writer import expand_short_sections as _expand_short
+            _md2 = _expand_short(markdown, plan, llm, log=log,
+                                reference_context=refs["writer_context"])
+            if _md2 and _md2 != markdown:
+                markdown = _md2
+        except Exception as _exc:  # noqa: BLE001
+            log(f"   ⚠ 章节补全跳过（{_exc}）")
 
     log("③ 排版并保存 Word 文档 ...")
     render_markdown_to_docx(
