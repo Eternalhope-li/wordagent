@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -89,6 +90,14 @@ STRONG_EDIT = ("修改", "编辑", "删除", "删掉", "替换", "改成", "改�
 # 弱编辑词：只有附了 .docx 时才视为编辑意图，避免误伤生成类需求
 WEAK_EDIT = ("调整", "更新", "修正", "补充", "完善", "排版", "格式", "新增", "添加",
              "去掉", "不要", "重排", "精修", "美化", "改")
+
+
+def _base_stem(name: str) -> str:
+    """去掉版本后缀，得到文档基础名（用于版本对命名）。"""
+    for suf in ("_完成版", "_原始版", "_修改版"):
+        if name.endswith(suf):
+            return name[: -len(suf)]
+    return name
 
 
 class WordAgentApp:
@@ -200,17 +209,16 @@ class WordAgentApp:
         ctk.CTkButton(orow, text="📂", width=44, height=32, corner_radius=10,
                       fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
                       font=ctk.CTkFont("Microsoft YaHei UI", 12), command=self._browse_dir).pack(side="left", padx=(8, 0))
-        self.overwrite_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(side, text="编辑时覆盖原文件（默认另存新文件）", variable=self.overwrite_var,
-                        font=ctk.CTkFont("Microsoft YaHei UI", 10),
-                        text_color=SIDEBAR_TEXT, fg_color=BRAND, hover_color=BRAND_HOVER,
-                        checkbox_width=18, checkbox_height=18).pack(anchor="w", padx=16, pady=(10, 0))
+        ctk.CTkLabel(side, text="编辑自动保留两版：原始版 + 完成版（可回退）",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 10), wraplength=200, justify="left",
+                     text_color=MUTED_TEXT).pack(anchor="w", padx=16, pady=(10, 0))
 
         # —— 常用操作 ——
         section("🛠 常用操作")
         for text, cmd in (
             ("📁 打开输出目录", self._open_output_dir),
             ("🕘 最近文档", self._show_recent),
+            ("🗂 版本管理", self._show_versions),
             ("🧠 上下文记忆", self._show_memory),
             ("🧹 清空对话", self._clear_chat),
             ("🗑 清空记忆", self._clear_memory),
@@ -408,6 +416,8 @@ class WordAgentApp:
                 return "edit", docx, others, "📄 检测到 .docx 与修改要求，将先读取文档内容再精准修改。"
             return "generate", None, [docx] + others, "📄 已把 .docx 作为模板参考（如需修改/填写，请加上“修改/填写”等词）。"
         if any(k in text for k in STRONG_EDIT):
+            if self.last_output and Path(self.last_output).exists():
+                return "edit", str(self.last_output), files, f"📄 将基于当前文档继续修改：{Path(self.last_output).name}"
             return "need_doc", None, files, "看起来你想编辑文档：请先点「📎 附件」添加要编辑的 .docx，再发送这条要求。"
         return "generate", None, files, ""
 
@@ -448,8 +458,9 @@ class WordAgentApp:
         self._current_mid = mid
         self._started_at = time.time()
         self._set_busy(True)
+        prev_output = str(self.last_output) if self.last_output else ""
         threading.Thread(target=self._worker_chat,
-                         args=(kind, text, mid, target, refs), daemon=True).start()
+                         args=(kind, text, mid, target, refs, prev_output), daemon=True).start()
         self.input_text.focus_set()
 
     def _set_busy(self, busy: bool, status: str = "") -> None:
@@ -463,7 +474,8 @@ class WordAgentApp:
         self.header_status.configure(text=text)
 
     # ================= Worker（后台线程） =================
-    def _worker_chat(self, kind: str, text: str, mid: int, target: str | None, refs: list[str]) -> None:
+    def _worker_chat(self, kind: str, text: str, mid: int, target: str | None, refs: list[str],
+                     prev_output: str = "") -> None:
         def log(msg: str) -> None:
             self.events.put(("bubble_text", mid, msg))
 
@@ -497,11 +509,23 @@ class WordAgentApp:
                     self.events.put(("cancelled", mid))
                     return
                 path = finalize_edit(self._edit_state, self.config, self.memory,
-                                     output_dir=output_dir, save_as_new=not self.overwrite_var.get(),
+                                     output_dir=output_dir, save_as_new=True,
                                      log=log, resolve_ambiguous=self._resolve_ambiguous,
-                                     on_warnings=self._on_warnings)
+                                     on_warnings=self._on_warnings, version_keep=True)
+                # 双版本归档：若被编辑的是之前生成的“最早版本”，移除它（只留 原始版+完成版）
+                try:
+                    src_p = Path(target)
+                    if prev_output and Path(prev_output) == src_p and src_p != Path(path) \
+                            and "versions" not in src_p.parts and src_p.suffix.lower() == ".docx" \
+                            and src_p.parent == output_dir:
+                        src_p.unlink(missing_ok=True)
+                        log(f"   已归档并移除最早版本：{src_p.name}")
+                except OSError:
+                    pass
                 usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
-                self.events.put(("done_edit", str(path), mid, usage))
+                base = _base_stem(Path(target).stem)
+                orig = output_dir / "versions" / f"{base}_原始版.docx"
+                self.events.put(("done_edit", str(path), mid, usage, str(orig)))
             elif kind == "fill":
                 path = fill_template(Path(target), text, self.config, self.memory, llm=llm, log=log)
                 usage = llm.usage_text() if hasattr(llm, "usage_text") else ""
@@ -669,22 +693,47 @@ class WordAgentApp:
             ("✕ 取消", BTN_SOLID, BTN_SOLID_HOVER, cancel),
         ])
 
-    def _finish_ok(self, path: str, mid: int, action: str, usage: str = "") -> None:
+    def _finish_ok(self, path: str, mid: int, action: str, usage: str = "", orig: str = "") -> None:
         self.last_output = Path(path)
         used = f"\n\n⚙ {usage}" if usage else ""
         elapsed = time.time() - self._started_at if self._started_at else 0
-        self._set_bubble_text(
-            mid,
-            f"✅ {action}完成（用时 {elapsed:.0f} 秒），文档已保存：\n{path}{used}\n\n"
-            "💡 继续对我说「把标题改成…」「再加一节结论…」即可接着修改。",
-        )
-        self._bubble_add_buttons(mid, [
-            ("📄 打开文档", BRAND, BRAND_HOVER, lambda: self._open_path(Path(path))),
-            ("📂 所在文件夹", BTN_SOLID, BTN_SOLID_HOVER, lambda: self._open_folder_of(Path(path))),
-        ])
+        done_p = Path(path)
+        if action == "修改" and orig and Path(orig).exists():
+            self._set_bubble_text(
+                mid,
+                f"✅ 修改完成（用时 {elapsed:.0f} 秒）\n📄 完成版：{path}\n"
+                f"🗂 原始版：{orig}{used}\n\n"
+                "共保留两个版本，可随时回退到原始版。",
+            )
+            self._bubble_add_buttons(mid, [
+                ("📄 打开完成版", BRAND, BRAND_HOVER, lambda: self._open_path(done_p)),
+                ("🗂 打开原版", BTN_SOLID, BTN_SOLID_HOVER, lambda: self._open_path(Path(orig))),
+                ("↩ 回退到原版", "#B45309", "#92400E", lambda: self._rollback(done_p, Path(orig))),
+            ])
+        else:
+            self._set_bubble_text(
+                mid,
+                f"✅ {action}完成（用时 {elapsed:.0f} 秒），文档已保存：\n{path}{used}\n\n"
+                "💡 继续对我说「把标题改成…」「再加一节结论…」即可接着修改。",
+            )
+            self._bubble_add_buttons(mid, [
+                ("📄 打开文档", BRAND, BRAND_HOVER, lambda: self._open_path(done_p)),
+                ("📂 所在文件夹", BTN_SOLID, BTN_SOLID_HOVER, lambda: self._open_folder_of(done_p)),
+            ])
         self.chat_history.append({"role": "assistant", "text": f"[{action}完成] {path}"})
         self._set_busy(False)
         self._set_status(f"✔ {action}完成")
+
+    def _rollback(self, done_p: Path, orig_p: Path) -> None:
+        """回退到原始版：用原始版覆盖完成版并打开。"""
+        try:
+            shutil.copy2(orig_p, done_p)
+            self.last_output = done_p
+            self._add_system_bubble(f"↩ 已回退到原始版：{done_p.name}")
+            self._set_status("✔ 已回退到原始版")
+            self._open_path(done_p)
+        except OSError as exc:
+            messagebox.showerror("回退失败", f"无法恢复原始版本：{exc}")
 
     def _finish_error(self, message: str, mid: int) -> None:
         self._set_bubble_text(mid, f"❌ 操作失败：\n{message}")
@@ -716,7 +765,8 @@ class WordAgentApp:
                 elif kind == "done_generate":
                     self._finish_ok(item[1], item[2], "生成", item[3] if len(item) > 3 else "")
                 elif kind == "done_edit":
-                    self._finish_ok(item[1], item[2], "修改", item[3] if len(item) > 3 else "")
+                    self._finish_ok(item[1], item[2], "修改", item[3] if len(item) > 3 else "",
+                                    item[4] if len(item) > 4 else "")
                 elif kind == "error":
                     self._finish_error(item[1], item[2])
         except queue.Empty:
@@ -929,6 +979,54 @@ class WordAgentApp:
             ctk.CTkButton(row, text="📂", width=44, height=32, corner_radius=10,
                           fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
                           command=lambda fp=f: self._open_folder_of(fp)).pack(side="right", padx=(4, 6), pady=4)
+
+    def _show_versions(self) -> None:
+        """版本管理：列出输出目录里全部 原始版/完成版 版本对，支持打开与回退。"""
+        out_dir = Path(self.outdir_var.get().strip()) or self.config.output_dir
+        ver_dir = out_dir / "versions"
+        pairs: dict[str, list] = {}
+        if ver_dir.is_dir():
+            for f in sorted(ver_dir.glob("*.docx"), key=lambda x: x.name):
+                name = _base_stem(f.stem)
+                if f.name.endswith("_原始版.docx"):
+                    pairs.setdefault(name, [None, None])[0] = f
+                elif f.name.endswith("_完成版.docx"):
+                    pairs.setdefault(name, [None, None])[1] = f
+        win = ctk.CTkToplevel(self.root)
+        win.title("版本管理")
+        win.geometry("720x480")
+        win.transient(self.root)
+        ctk.CTkLabel(win, text="🗂 版本管理（每份文档只保留 原始版 + 完成版）",
+                     font=ctk.CTkFont("Microsoft YaHei UI", 15, "bold")).pack(anchor="w", padx=18, pady=(16, 8))
+        if not pairs:
+            ctk.CTkLabel(win, text="（还没有编辑过的文档，生成/修改后这里会出现版本对）",
+                         font=ctk.CTkFont("Microsoft YaHei UI", 12),
+                         text_color=MUTED_TEXT).pack(anchor="w", padx=18, pady=20)
+            return
+        box = ctk.CTkScrollableFrame(win, corner_radius=12)
+        box.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+        for name in sorted(pairs):
+            orig, done = pairs[name]
+            row = ctk.CTkFrame(box, corner_radius=10)
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=f"📄 {name}", anchor="w", width=200,
+                         font=ctk.CTkFont("Microsoft YaHei UI", 12, "bold"),
+                         text_color=SIDEBAR_BTN_TEXT).pack(side="left", padx=10, pady=6)
+            if done:
+                ctk.CTkButton(row, text="打开完成版", width=96, height=30, corner_radius=10,
+                              fg_color=BRAND, hover_color=BRAND_HOVER, text_color="white",
+                              font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                              command=lambda f=done: self._open_path(f)).pack(side="left", padx=4)
+            if orig:
+                ctk.CTkButton(row, text="打开原版", width=88, height=30, corner_radius=10,
+                              fg_color=BTN_SOLID, hover_color=BTN_SOLID_HOVER,
+                              font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                              command=lambda f=orig: self._open_path(f)).pack(side="left", padx=4)
+            if orig and done:
+                ctk.CTkButton(row, text="↩ 回退", width=72, height=30, corner_radius=10,
+                              fg_color="#B45309", hover_color="#92400E", text_color="white",
+                              font=ctk.CTkFont("Microsoft YaHei UI", 11),
+                              command=lambda o=orig, d=done: self._rollback(d, o)).pack(side="left", padx=4)
 
     def _show_memory(self) -> None:
         win = ctk.CTkToplevel(self.root)

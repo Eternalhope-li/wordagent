@@ -885,6 +885,7 @@ def finalize_edit(
     auto_fix: bool = False,
     resolve_ambiguous: Optional[Callable[[dict, list[str]], Optional[str]]] = None,
     on_warnings: Optional[Callable[[list[str]], bool]] = None,
+    version_keep: bool = False,
 ) -> Path:
     """第二阶段：应用修改 -> 结构校验 -> AI 复核（建议） -> 备份 -> 保存 -> 完整性校验。"""
     src: Path = state["src"]
@@ -915,16 +916,39 @@ def finalize_edit(
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(output_dir or config.output_dir)
-    backup_dir = out_dir / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_path = backup_dir / f"{src.stem}_备份_{stamp}{src.suffix}"
-    shutil.copy2(src, backup_path)
-    log(f"   已备份原文件：{backup_path}")
-
-    if save_as_new:
-        out_path = src.parent / f"{src.stem}_修改版_{stamp}{src.suffix}"
+    if version_keep:
+        # 双版本模式：始终只保留「原始版 + 完成版」两个版本，方便回退
+        ver_dir = out_dir / "versions"
+        ver_dir.mkdir(parents=True, exist_ok=True)
+        base = src.stem
+        for suf in ("_完成版", "_原始版", "_修改版"):
+            if base.endswith(suf):
+                base = base[: -len(suf)]
+                break
+        orig_v = ver_dir / f"{base}_原始版.docx"
+        done_v = ver_dir / f"{base}_完成版.docx"
+        shutil.copy2(src, orig_v)
+        log(f"   已保存原始版：{orig_v.name}")
+        for old_file in list(ver_dir.glob(f"{base}_*")):
+            if old_file.name not in (orig_v.name, done_v.name):
+                try:
+                    old_file.unlink()
+                    log(f"   已移除最早版本：{old_file.name}")
+                except OSError:
+                    pass
+        out_path = done_v
+        backup_path = orig_v
     else:
-        out_path = src
+        backup_dir = out_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"{src.stem}_备份_{stamp}{src.suffix}"
+        shutil.copy2(src, backup_path)
+        log(f"   已备份原文件：{backup_path}")
+
+        if save_as_new:
+            out_path = src.parent / f"{src.stem}_修改版_{stamp}{src.suffix}"
+        else:
+            out_path = src
     doc.save(str(out_path))
     log(f"   已保存：{out_path}")
  
@@ -949,6 +973,7 @@ def finalize_edit(
             "title": src.name,
             "file": str(out_path),
             "backup": str(backup_path),
+            "original": str(orig_v) if version_keep else "",
             "summary": plan.get("summary", ""),
             "operations": len(operations),
             "verified": verify,

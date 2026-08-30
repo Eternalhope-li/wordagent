@@ -20,7 +20,7 @@ from .pipeline import run_pipeline, safe_filename
 from .templater import fill_template
 from .verify import QualityReport, fix_document, verify_document
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 __all__ = [
     "Config", "LLMClient", "LLMError", "Memory",
     "run_pipeline", "safe_filename",

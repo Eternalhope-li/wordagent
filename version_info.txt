@@ -14,12 +14,12 @@
       StringTable('080404B0', [
         StringStruct('CompanyName', 'eternalhope'),
         StringStruct('FileDescription', 'WordAgent AI 文档助手'),
-        StringStruct('FileVersion', '1.8.0'),
+        StringStruct('FileVersion', '1.8.1'),
         StringStruct('InternalName', 'WordAgent'),
         StringStruct('LegalCopyright', 'Copyright (c) 2026 eternalhope'),
         StringStruct('OriginalFilename', 'WordAgent.exe'),
         StringStruct('ProductName', 'WordAgent AI 文档助手'),
-        StringStruct('ProductVersion', '1.8.0')
+        StringStruct('ProductVersion', '1.8.1')
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
