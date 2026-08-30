@@ -30,7 +30,7 @@ VERSION_LABEL = f"v{__version__}"
 
 PLACEHOLDER = (
     "输入你的文档要求，例如：\n"
-    "· 写一份《数据库课程实验报告》，含实验目的、实验环境、实验步骤、结果与分析\n"
+    "· 写一份实验报告 / 周报 / 方案 / 会议纪要……\n"
     "· 或点「📎 附件」添加 .docx 后说：把标题改成《XXX》，第二节改得更正式"
 )
 
@@ -255,7 +255,7 @@ class WordAgentApp:
         chat_head.grid(row=0, column=0, sticky="ew", padx=14, pady=(10, 0))
         ctk.CTkLabel(chat_head, text="💬 对话", font=ctk.CTkFont("Microsoft YaHei UI", 14, "bold"),
                      text_color=SIDEBAR_BTN_TEXT).pack(side="left")
-        ctk.CTkLabel(chat_head, text="AI 自动识别：生成新文档 / 按模板填写 / 编辑已有文档",
+        ctk.CTkLabel(chat_head, text="自动识别需求：生成新文档 / 按模板填写 / 编辑已有文档",
                      font=ctk.CTkFont("Microsoft YaHei UI", 10),
                      text_color=MUTED_TEXT).pack(side="right")
 
@@ -277,7 +277,7 @@ class WordAgentApp:
         self.chat_scroll.grid(row=2, column=0, sticky="nsew", padx=14, pady=(2, 4))
         self.chat_scroll.grid_columnconfigure(0, weight=1)
         # 底部常驻提示：让聊天区底部始终有信息感，不出现“空灰块”
-        self._scroll_hint = ctk.CTkLabel(self.chat_scroll, text="💡 按 Enter 发送 · Shift+Enter 换行 · 可附 .docx / 图片 / PDF 参考文件",
+        self._scroll_hint = ctk.CTkLabel(self.chat_scroll, text="💡 按 Enter 发送 · Shift+Enter 换行 · 可按需附 .docx / 图片 / PDF 等参考文件",
                                          font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT)
         self._scroll_hint.pack(side="bottom", fill="x", pady=(6, 8))
 
@@ -1052,7 +1052,7 @@ class WordAgentApp:
             self._bubbles.clear()
             self.chat_history.clear()
             self._scroll_hint = ctk.CTkLabel(self.chat_scroll,
-                                             text="💡 按 Enter 发送 · Shift+Enter 换行 · 可附 .docx / 图片 / PDF 参考文件",
+                                             text="💡 按 Enter 发送 · Shift+Enter 换行 · 可按需附 .docx / 图片 / PDF 等参考文件",
                                              font=ctk.CTkFont("Microsoft YaHei UI", 10), text_color=MUTED_TEXT)
             self._scroll_hint.pack(side="bottom", fill="x", pady=(6, 8))
             self._greet()
@@ -1083,12 +1083,12 @@ class WordAgentApp:
         self._add_assist_bubble(
             "👋 你好，我是 WordAgent！\n\n"
             "直接告诉我要什么文档即可，例如：\n"
-            "· 写一份《数据库课程实验报告》\n"
+            "· 写一份实验报告\n"
             "· 写一份本周工作周报\n"
-            "· 生成《2026 市场推广方案》\n\n"
+            "· 生成一份推广方案\n\n"
             "要编辑或套模板时，先点「📎 附件」添加 .docx，然后说：\n"
             "· 把标题改成《XXX》，第二节改得更正式\n"
-            "· 按模板填写这份实验报告\n\n"
+            "· 按模板填写这份报告\n\n"
             "我会自动判断需求类型，支持连续对话与上下文记忆。"
         )
 
